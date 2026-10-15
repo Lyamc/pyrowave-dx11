@@ -1,7 +1,7 @@
 // pyrowave-dx11 agent harness plugin (loaded via OPENCODE_CONFIG_DIR=tools/agent/ocdir).
-// Keeps tool output small for the 32k-context local model and adds a second enforcement layer for the hard rules.
-const READ_MAX_LINES = 120;
-const OUT_MAX_CHARS = 7000;     // ~2k tokens per tool result
+// Keeps tool output small for the 64k-context local model and adds a second enforcement layer for the hard rules.
+const READ_MAX_LINES = 200;
+const OUT_MAX_CHARS = 12000;    // ~3.5k tokens per tool result
 const FORBIDDEN_EDIT = /(^|[\\/])(reference|prototype)[\\/]/i;
 const HARNESS_FILES = /(^|[\\/])(tools[\\/]run_agent\.py|tools[\\/]agent[\\/]|logs[\\/]|\.git[\\/])/i;
 const BAD_BASH = [
@@ -45,6 +45,6 @@ export const PwHarness = async () => ({
     output.context.push(
       "Harness note: keep the summary short (<= 25 lines). Include the task id, files created so far, the last build/test " +
       "result, and the next concrete step. After compaction do NOT re-read whole files: read the handoff file " +
-      "docs/progress/<task>.md and only the line ranges you need (<= 120 lines per read).");
+      "docs/progress/<task>.md and only the line ranges you need (<= 200 lines per read).");
   },
 });

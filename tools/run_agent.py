@@ -2,7 +2,7 @@
 """Autonomous task driver for pyrowave-dx11.
 
 Runs opencode (local llama-server model) over the AGENTS.md tasks in dependency order.
-  * one fresh opencode session per "session" (keeps the 32k context small); handoff via docs/progress/<task>.md
+  * one fresh opencode session per "session" (keeps the 64k context small); handoff via docs/progress/<task>.md
   * after every session: enforce hard rules, then run tests/accept_<task>.cmd independently
   * task done = accept script exit 0 + a "PASS <criterion>" line for every criterion + work committed
   * bounded retries; a failed task is recorded in logs/STATUS.md and the driver moves on to independent tasks
@@ -210,9 +210,9 @@ HARD_RULES = """HARD RULES (the harness enforces them; violations are reverted a
    (confirmed: `nvidia-smi` there reports it, which also answers OQ-19); keep the existing `pyrowave` codec row with the encoder
    reported as `pyrowave-d3d11` (OQ-13 = A); input YUV420P only (OQ-20); all other OQs: documented default."""
 
-WORKFLOW = """HOW TO WORK (your context window is only 32k tokens, so be frugal):
+WORKFLOW = """HOW TO WORK (your context window is 64k tokens and fills fast, so be frugal):
 - AGENTS.md is already in your instructions. Do not re-read it. Read ONE file at a time, in pieces: grep first, then read
-  <=120 lines (the harness caps reads at 120 lines and any tool output at ~7000 chars). Never read reference/pyrowave/pyrowave.h
+  <=200 lines (the harness caps reads at 200 lines and any tool output at ~12000 chars). Never read reference/pyrowave/pyrowave.h
   whole: grep for the struct/enum you need, then read just those lines.
 - Keep command output short: append `2>&1 | Select-Object -Last 40` to builds and tests. Your shell is Windows PowerShell 5.1.
 - Build tools: prefix MSVC/fxc/cmake/ninja commands with `tools\\devenv.cmd`, e.g.

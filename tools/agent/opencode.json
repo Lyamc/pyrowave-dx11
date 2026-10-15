@@ -25,7 +25,7 @@
           "reasoning": true,
           "tool_call": true,
           "limit": {
-            "context": 32768,
+            "context": 65536,
             "output": 8192
           },
           "id": "C:\\AI\\dflash-models\\qwen3.6-35b-a3b\\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
@@ -36,7 +36,7 @@
   "compaction": {
     "auto": true,
     "prune": true,
-    "reserved": 6000
+    "reserved": 10000
   },
   "permission": {
     "edit": {
