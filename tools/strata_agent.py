@@ -6,6 +6,7 @@ The reply is printed and, with --out, written to that file (review before commit
 files or runs commands itself; this is a read-files -> answer loop.
 """
 import argparse, json, os, sys, time, urllib.request
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 URL = os.environ.get("STRATA_URL", "http://127.0.0.1:8080/v1/chat/completions")
@@ -18,8 +19,8 @@ def main():
     ap.add_argument("--task", required=True)
     ap.add_argument("--file", action="append", default=[])
     ap.add_argument("--out")
-    ap.add_argument("--max-tokens", type=int, default=4096)
-    ap.add_argument("--effort", default="medium")
+    ap.add_argument("--max-tokens", type=int, default=16000)
+    ap.add_argument("--effort", default="low")
     a = ap.parse_args()
     parts = [PLAN] if (PLAN := open(os.path.join(ROOT, "PLAN.md"), encoding="utf-8").read()) else []
     for f in a.file:
@@ -32,7 +33,15 @@ def main():
     t = time.time()
     with urllib.request.urlopen(req, timeout=3600) as r:
         res = json.load(r)
-    msg = res["choices"][0]["message"]["content"]
+    os.makedirs(os.path.join(ROOT, "strata-out"), exist_ok=True)
+    with open(os.path.join(ROOT, "strata-out", time.strftime("%Y%m%d-%H%M%S") + ".json"), "w", encoding="utf-8") as fh:
+        json.dump(res, fh, indent=1)
+    choice = res["choices"][0]
+    msg = choice["message"].get("content")
+    if not msg:
+        sys.stderr.write(f"[strata] no final answer (finish_reason={choice.get('finish_reason')}); "
+                         "reasoning used the whole budget - raise --max-tokens or lower --effort\n")
+        sys.exit(2)
     sys.stderr.write(f"[strata] {time.time()-t:.1f}s usage={res.get('usage')}\n")
     print(msg)
     if a.out:
@@ -41,3 +50,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
