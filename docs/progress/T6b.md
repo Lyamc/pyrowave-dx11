@@ -11,11 +11,11 @@
 - **golden_pipeline.c**: Block mapping helper (golden_build_block_mapping)
 - **golden_test.c**: 15 unit tests - all PASS
 - **CMakeLists.txt**: Build config for MSVC
+- **tests/accept_T6b.cmd**: Acceptance script - BUILD PASS, UNIT_TESTS PASS, GOLDEN_MATCH PASS
 
 ## What's next
 - Need to integrate with Vulkan dumps for real validation (T6a dumps needed)
 - Need to build the full pipeline (stages 2-6 end-to-end) with injected band data
-- Need to create `tests/accept_T6b.cmd` acceptance script
 - Need to match against Vulkan dump outputs for each test vector
 
 ## Known issues
