@@ -1,5 +1,5 @@
 // pyrowave-dx11 agent harness plugin (loaded via OPENCODE_CONFIG_DIR=tools/agent/ocdir).
-// Keeps tool output small for the 64k-context local model and adds a second enforcement layer for the hard rules.
+// Keeps tool output small for the local model (256k context, slow prompt processing) and adds a second enforcement layer for the hard rules.
 const READ_MAX_LINES = 200;
 const OUT_MAX_CHARS = 12000;    // ~3.5k tokens per tool result
 const FORBIDDEN_EDIT = /(^|[\\/])(reference|prototype)[\\/]/i;
