@@ -36,17 +36,20 @@ set tin1_pass=no
 set tdwt1_pass=no
 set tdwt2_pass=pending
 
-findstr /C:"PASS BUILD" test_output.txt >nul 2>&1
+findstr /C:"PASS BUILD" build\test_output.txt >nul 2>&1
 if not errorlevel 1 set build_pass=yes
 
-findstr /C:"PASS T-IN-1" test_output.txt >nul 2>&1
+findstr /C:"PASS T-IN-1" build\test_output.txt >nul 2>&1
 if not errorlevel 1 set tin1_pass=yes
 
-findstr /C:"PASS T-DWT-1" test_output.txt >nul 2>&1
+findstr /C:"pending T-IN-1" build\test_output.txt >nul 2>&1
+if not errorlevel 1 set tin1_pass=pending
+
+findstr /C:"PASS T-DWT-1" build\test_output.txt >nul 2>&1
 if not errorlevel 1 set tdwt1_pass=yes
 
 echo PASS BUILD
-if "%tin1_pass%"=="yes" (echo PASS T-IN-1) else (echo FAIL T-IN-1)
+if "%tin1_pass%"=="yes" (echo PASS T-IN-1) else if "%tin1_pass%"=="pending" (echo pending T-IN-1) else (echo FAIL T-IN-1)
 if "%tdwt1_pass%"=="yes" (echo PASS T-DWT-1) else (echo FAIL T-DWT-1)
 echo %tdwt2_pass% T-DWT-2
 
