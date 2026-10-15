@@ -46,8 +46,8 @@ findstr /C:"PASS T-DWT-1" test_output.txt >nul 2>&1
 if not errorlevel 1 set tdwt1_pass=yes
 
 echo PASS BUILD
-echo %tin1_pass% T-IN-1
-echo %tdwt1_pass% T-DWT-1
+if "%tin1_pass%"=="yes" (echo PASS T-IN-1) else (echo FAIL T-IN-1)
+if "%tdwt1_pass%"=="yes" (echo PASS T-DWT-1) else (echo FAIL T-DWT-1)
 echo %tdwt2_pass% T-DWT-2
 
 if "%build_pass%"=="no" exit /b 1
