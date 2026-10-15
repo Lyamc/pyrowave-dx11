@@ -1,0 +1,121 @@
+{
+  "order": ["T0", "T1", "T2a", "T6a", "T6b", "T2b", "T3", "T4", "T5a", "T5b", "T6c", "T6d", "T2c", "T5c"],
+  "excluded": {
+    "T7": "AN515 run: needs the user's explicit go-ahead (AGENTS.md A5). Never run by this harness.",
+    "T8": "etherquic integration: separate repo, needs the user's go-ahead. Never run by this harness."
+  },
+  "tasks": {
+    "T0": {
+      "title": "Skeleton: src/ CMake project (MSVC, static CRT), fxc build step with the AGENTS.md A4 flags, embedded bytecode headers, src/include/pyrowave_d3d11.h (C ABI from INTEGRATION.md A4) with static_asserts on every struct shared with reference/pyrowave/pyrowave.h, device creation (hardware adapter, FL 11_0, WARP/software rejected unless flag bit1), cbuffer structs with static_asserted offsets",
+      "deps": [],
+      "read": ["docs/INTEGRATION.md (section 4, from line 108)", "docs/stages/00_input.md", "docs/SPEC.md section 2 (lines 31-44)", "reference/pyrowave/pyrowave.h (grep for the structs/enums you mirror)", "prototype/dx11dwt.cpp lines 100-130 and 340-380 (device + format support checks)"],
+      "acceptance": "builds with /W4 /WX; pwd3d11_create_device succeeds on HYTE and rejects WARP; T-IN-0 (plane bytes uploaded as R8_UNORM textures read back equal the host bytes, exact)",
+      "criteria": ["BUILD", "CREATE_DEVICE", "REJECT_WARP", "T-IN-0"],
+      "notes": "Suggested layout: src/CMakeLists.txt building pyrowave_d3d11.dll (+ a static lib for tests) and src/tests/test_t0.cpp; a trivial placeholder shader (e.g. src/shaders/common.hlsli + a probe .hlsl) is enough to prove the fxc step. Use CMake with -G Ninja and -DCMAKE_BUILD_TYPE=Release, build dir build/. Test exe may use d3dcompiler only if needed; the DLL must not."
+    },
+    "T1": {
+      "title": "Move the forward DWT from prototype/ into src/ (upload + 13 dispatches), keeping the band layout (R16F L0-1, R32F L2-4)",
+      "deps": ["T0"],
+      "read": ["docs/stages/01_dwt.md", "docs/stages/00_input.md (Test oracle)", "docs/VALIDATION.md section 6 (Tolerances, line 107)", "prototype/dwt.hlsl", "prototype/dx11dwt.cpp (grep, read in chunks)", "prototype/README.md"],
+      "acceptance": "T-IN-1, T-DWT-1, T-DWT-2 (tolerance per VALIDATION.md A6)",
+      "criteria": ["BUILD", "T-IN-1", "T-DWT-1", "T-DWT-2"],
+      "notes": "Copy code from prototype/ into src/; never edit prototype/. Shaders must now build offline with fxc /Gis /Ges /WX and be embedded. T-IN-1 needs the Vulkan side only for the cross-API part; for the HYTE part compare with float(c)/255.0f on the CPU and record the Vulkan comparison as pending in OPEN_QUESTIONS.md if you cannot get it."
+    },
+    "T2a": {
+      "title": "Tables and probes on the reference (Linux box lyam@192.168.0.24, RTX 2060 SUPER): dump the 60-entry rdo_distortion_scale table from the Linux build; T-Q-5 probe of the FS-Q1/FS-Q2 division results on the RTX (and lavapipe on .24 if available there); f16 rounding sweep for OQ-3",
+      "deps": [],
+      "read": ["docs/stages/02_quant.md sections 2 and 7 (grep 'A2', 'A7', 'T-Q-5', 'rdo_distortion_scale')", "docs/OPEN_QUESTIONS.md rows OQ-1, OQ-3", "docs/VALIDATION.md sections 1-3"],
+      "acceptance": "table committed (e.g. src/tables_rdo.inc or testdata/) with its source command; OQ-1 and OQ-3 answered with data in docs/OPEN_QUESTIONS.md",
+      "criteria": ["RDO_TABLE", "T-Q-5", "OQ-1", "OQ-3"],
+      "notes": "Remote work goes ONLY in ~/scratch/pwd3d11-ref on 192.168.0.24 (copy reference/pyrowave there with scp, build with CMake defaults). Do not touch ~/Build/etherquic or any other directory there. HD 6670 (AN515) parts of the OQ-3 sweep are forbidden now: do the RTX (Vulkan on .24) and HYTE's own GPU (D3D11, RTX 3060), and record the HD 6670 part as deferred to T7. The accept script can verify the committed artefacts (table file has 60 entries, probe result files exist, OQ rows updated) without ssh."
+    },
+    "T6a": {
+      "title": "tools/vkref patches (dump hooks 0001, band injection 0002) against reference a0d2e71 plus a small driver; produce dumps + manifests for all test vectors on the RTX (192.168.0.24)",
+      "deps": [],
+      "read": ["docs/VALIDATION.md sections 3 and 7 (lines 29-140)"],
+      "acceptance": "patches apply to a0d2e71 (git apply --check against a pristine copy of reference/pyrowave); manifests for all vectors",
+      "criteria": ["PATCHES_APPLY", "MANIFESTS"],
+      "notes": "Remote work goes ONLY in ~/scratch/pwd3d11-ref on 192.168.0.24. Large dumps stay on .24 (reference them by sha256 in testdata/manifests); commit only small files (< 5 MB per vector). The accept script may check patches locally with git apply --check against a temp copy of reference/pyrowave and check the committed manifests."
+    },
+    "T6b": {
+      "title": "CPU golden model of stages 2-6 in tools/golden (C++), fixed reduction order, both finalize variants (OQ-5)",
+      "deps": ["T2a"],
+      "read": ["docs/stages/02_quant.md section 4", "docs/stages/03_analyze_rate_control.md sections 4-5", "docs/stages/04_resolve_rate_control.md section 3", "docs/stages/05_block_packing.md sections 4-5", "docs/stages/06_frame_and_host.md section 3", "docs/SPEC.md section 6"],
+      "acceptance": "matches the Vulkan dumps exactly except at proven FS points",
+      "criteria": ["BUILD", "GOLDEN_MATCH"],
+      "notes": "If T6a dumps are not available yet, build the model and its unit tests first, and match against whatever Vulkan output exists (public API packets per VALIDATION 3.1). Work stage by stage; commit each stage."
+    },
+    "T2b": {
+      "title": "Quant shader (src/shaders/quant.hlsl), one dispatch per band (42)",
+      "deps": ["T1", "T2a", "T6b"],
+      "read": ["docs/stages/02_quant.md", "docs/SPEC.md sections 3-4"],
+      "acceptance": "T-Q-0..T-Q-4 against the golden model and the Vulkan dumps (M3)",
+      "criteria": ["BUILD", "T-Q-0", "T-Q-1", "T-Q-2", "T-Q-3", "T-Q-4"],
+      "notes": ""
+    },
+    "T3": {
+      "title": "Analyze (42 dispatches) + finalize, bug-compatible windowed scan",
+      "deps": ["T2b"],
+      "read": ["docs/stages/03_analyze_rate_control.md"],
+      "acceptance": "T-A-1..T-A-4",
+      "criteria": ["BUILD", "T-A-1", "T-A-2", "T-A-3", "T-A-4"],
+      "notes": ""
+    },
+    "T4": {
+      "title": "Resolve rate control",
+      "deps": ["T3"],
+      "read": ["docs/stages/04_resolve_rate_control.md"],
+      "acceptance": "T-R-1..T-R-3",
+      "criteria": ["BUILD", "T-R-1", "T-R-2", "T-R-3"],
+      "notes": ""
+    },
+    "T5a": {
+      "title": "Block packing shader",
+      "deps": ["T4"],
+      "read": ["docs/stages/05_block_packing.md"],
+      "acceptance": "T-P-1..T-P-3",
+      "criteria": ["BUILD", "T-P-1", "T-P-2", "T-P-3"],
+      "notes": ""
+    },
+    "T5b": {
+      "title": "Frame orchestration, readback, CPU packetize, sequence handling, C ABI encode_cpu/compute_num_packets/packetize",
+      "deps": ["T5a"],
+      "read": ["docs/stages/06_frame_and_host.md", "docs/INTEGRATION.md section 4"],
+      "acceptance": "T-H-1..T-H-3; T-P-4 (end to end, decoded by the Vulkan decoder)",
+      "criteria": ["BUILD", "T-H-1", "T-H-2", "T-H-3", "T-P-4"],
+      "notes": "Vulkan decoding for T-P-4 runs on 192.168.0.24 in ~/scratch/pwd3d11-ref only."
+    },
+    "T6c": {
+      "title": "D3D11 debug build: dump hooks in the same format as tools/vkref, pwd3d11_debug_run_stage injection",
+      "deps": ["T0"],
+      "read": ["docs/VALIDATION.md sections 3.4 and 5"],
+      "acceptance": "round-trips a Vulkan dump through each stage",
+      "criteria": ["BUILD", "ROUNDTRIP"],
+      "notes": "Only stages that exist in src/ so far can be round-tripped; implement the hook format and injection API for those, and record what is pending."
+    },
+    "T6d": {
+      "title": "tools/pwcompare.py and tools/genvectors.py",
+      "deps": ["T6a"],
+      "read": ["docs/VALIDATION.md sections 4 and 7"],
+      "acceptance": "reports PASS / FS-ONLY / FAIL with locations",
+      "criteria": ["PWCOMPARE", "GENVECTORS"],
+      "notes": "Python is C:\\Users\\Lyam\\AppData\\Local\\Programs\\Python\\Python313\\python.exe (not on PATH). Standard library (plus numpy if already installed) only."
+    },
+    "T2c": {
+      "title": "Merge the quant dispatches (band table, one dispatch)",
+      "deps": ["T2b"],
+      "read": ["docs/stages/02_quant.md section 8 and the A8 text"],
+      "acceptance": "identical buffers to T2b; timing not worse",
+      "criteria": ["BUILD", "IDENTICAL", "TIMING"],
+      "notes": ""
+    },
+    "T5c": {
+      "title": "Merge the packing dispatches",
+      "deps": ["T5b"],
+      "read": ["docs/stages/06_frame_and_host.md section 2"],
+      "acceptance": "packets identical to T5b",
+      "criteria": ["BUILD", "IDENTICAL"],
+      "notes": ""
+    }
+  }
+}

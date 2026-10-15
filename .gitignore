@@ -4,3 +4,4 @@
 build/
 strata-out/
 __pycache__/
+logs/
