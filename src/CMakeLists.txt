@@ -17,25 +17,35 @@ set(SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
 set(SHADER_OUT "${CMAKE_CURRENT_BINARY_DIR}/shaders")
 file(MAKE_DIRECTORY "${SHADER_OUT}")
 
-# Precompile the probe shader (cs_5_0, /O3 /WX /Ges /Gis)
-set(PROBE_SRC "${SHADER_DIR}/probe.hlsl")
-set(PROBE_Dxbc "${SHADER_OUT}/probe.dxbc")
-set(PROBE_HDR "${SHADER_OUT}/probe_dxbc.h")
+# Precompile shaders (cs_5_0, /O3 /WX /Ges /Gis)
+# /Fh outputs a C header with the bytecode as a byte array.
+# We then add a size constant using a Python post-processor.
+# ------------------------------------------------------------------
+set(EMBED_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/../tools/embed_shader.py")
 
-add_custom_command(
-    OUTPUT "${PROBE_Dxbc}" "${PROBE_HDR}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUT}"
-    COMMAND fxc /nologo /T cs_5_0 /E main /O3 /WX /Ges /Gis
-            /Fc "${PROBE_Dxbc}" /Vn g_probe_dxbc "${PROBE_SRC}"
-    COMMAND ${CMAKE_COMMAND} -E echo "// Embedded probe shader bytecode" > "${PROBE_HDR}"
-    COMMAND ${CMAKE_COMMAND} -E echo "#pragma once" >> "${PROBE_HDR}"
-    COMMAND ${CMAKE_COMMAND} -E cat "${PROBE_Dxbc}" >> "${PROBE_HDR}"
-    DEPENDS "${PROBE_SRC}"
-    COMMENT "[fxc] probe.hlsl -> probe.dxbc"
-    VERBATIM
-)
+function(precompile_shader name src_file)
+    set(SRC "${SHADER_DIR}/${src_file}")
+    set(Hdr "${SHADER_OUT}/${name}_dxbc.h")
 
-add_custom_target(shaders ALL DEPENDS "${PROBE_Dxbc}" "${PROBE_HDR}")
+    add_custom_command(
+        OUTPUT "${Hdr}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUT}"
+        COMMAND fxc /nologo /T cs_5_0 /E main /O3 /WX /Ges /Gis
+                /Fh "${Hdr}" /Vn g_${name}_dxbc "${SRC}"
+        COMMAND "C:\\Users\\Lyam\\AppData\\Local\\Programs\\Python\\Python313\\python.exe"
+                "${EMBED_SCRIPT}" "${Hdr}" "g_${name}_dxbc"
+        DEPENDS "${SRC}" "${EMBED_SCRIPT}"
+        COMMENT "[fxc] ${src_file} -> ${name}_dxbc.h"
+        VERBATIM
+    )
+
+    set(${name}_Hdr "${Hdr}" PARENT_SCOPE)
+endfunction()
+
+precompile_shader(dwt dwt.hlsl)
+precompile_shader(probe probe.hlsl)
+
+add_custom_target(shaders ALL DEPENDS "${dwt_Hdr}" "${probe_Hdr}")
 
 # ------------------------------------------------------------------
 # Library: pyrowave_d3d11.dll
@@ -43,7 +53,8 @@ add_custom_target(shaders ALL DEPENDS "${PROBE_Dxbc}" "${PROBE_HDR}")
 add_library(pyrowave_d3d11 SHARED
     device.cpp
     c_api.cpp
-    ${PROBE_HDR}
+    ${dwt_Hdr}
+    ${probe_Hdr}
 )
 target_include_directories(pyrowave_d3d11 PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -56,19 +67,14 @@ set_target_properties(pyrowave_d3d11 PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
 )
 
-# Embed shader bytecode as a resource
-add_custom_command(TARGET pyrowave_d3d11 POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PROBE_Dxbc}" "$<TARGET_FILE_DIR:pyrowave_d3d11>"
-    COMMENT "[copy] probe.dxbc -> output dir"
-)
-
 # ------------------------------------------------------------------
 # Static lib for tests (no DLL export)
 # ------------------------------------------------------------------
 add_library(pyrowave_d3d11_static STATIC
     device.cpp
     c_api.cpp
-    ${PROBE_HDR}
+    ${dwt_Hdr}
+    ${probe_Hdr}
 )
 target_include_directories(pyrowave_d3d11_static PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -85,9 +91,17 @@ target_include_directories(test_t0 PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}"
 )
 target_link_libraries(test_t0 PRIVATE d3d11 dxgi d3dcompiler)
-# Add device.cpp and c_api.cpp to the test so it can call pwd3d11_* functions
 target_sources(test_t0 PRIVATE device.cpp c_api.cpp)
 set_target_properties(test_t0 PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+add_executable(test_t1 tests/test_t1.cpp)
+target_include_directories(test_t1 PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+target_link_libraries(test_t1 PRIVATE d3d11 dxgi d3dcompiler)
+set_target_properties(test_t1 PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
 )
 
