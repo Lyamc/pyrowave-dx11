@@ -5,8 +5,8 @@
 - Created patch 0002 (inject-bands): adds `encode_bands()` C API entry point for injecting pre-computed bands
 - Created 56 manifests in `testdata/manifests/` (8 vectors x 7 sizes)
 - Created acceptance test `tests/accept_T6a.cmd` / `tests/accept_T6a.py`
-- Verified patches apply to a0d2e71 (tested on 192.168.0.24)
-- Verified acceptance test passes (PASS PATCHES, PASS MANIFESTS)
+- Verified patches apply to a0d2e71 (tested on 192.168.0.24 and locally)
+- Acceptance test criteria: PATCHES_APPLY, MANIFESTS — both PASS
 
 ## Not Done (deferred)
 - Building patched pyrowave on .24 (requires Granite framework checkout)
