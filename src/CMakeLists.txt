@@ -99,6 +99,7 @@ set_target_properties(test_t0 PROPERTIES
 add_executable(test_t1 tests/test_t1.cpp)
 target_include_directories(test_t1 PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_BINARY_DIR}"
 )
 target_link_libraries(test_t1 PRIVATE d3d11 dxgi d3dcompiler)
 set_target_properties(test_t1 PROPERTIES
