@@ -3,7 +3,9 @@
   "autoupdate": false,
   "share": "disabled",
   "snapshot": false,
-  "enabled_providers": ["llamacpp"],
+  "enabled_providers": [
+    "llamacpp"
+  ],
   "model": "llamacpp/qwen3.6-35b-a3b",
   "small_model": "llamacpp/qwen3.6-35b-a3b",
   "provider": {
@@ -22,12 +24,20 @@
           "name": "Qwen3.6-35B-A3B Q4 (DFlash2, local)",
           "reasoning": true,
           "tool_call": true,
-          "limit": { "context": 32768, "output": 8192 }
+          "limit": {
+            "context": 32768,
+            "output": 8192
+          },
+          "id": "C:\\AI\\dflash-models\\qwen3.6-35b-a3b\\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
         }
       }
     }
   },
-  "compaction": { "auto": true, "prune": true, "reserved": 6000 },
+  "compaction": {
+    "auto": true,
+    "prune": true,
+    "reserved": 6000
+  },
   "permission": {
     "edit": {
       "*": "allow",
@@ -99,8 +109,7 @@
       "ssh -o BatchMode=yes lyam@192.168.0.24 *": "allow",
       "ssh -o BatchMode=yes -o ConnectTimeout=* lyam@192.168.0.24 *": "allow",
       "ssh lyam@192.168.0.24 *": "allow",
-      "scp *lyam@192.168.0.24:*": "allow",
-      "*192.168.0.58*": "deny"
+      "scp *lyam@192.168.0.24:*": "allow"
     },
     "external_directory": {
       "*": "deny",
