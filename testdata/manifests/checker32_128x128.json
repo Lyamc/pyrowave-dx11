@@ -1,0 +1,81 @@
+{
+  "vector": "checker32",
+  "W": 128,
+  "H": 128,
+  "budget": 32768,
+  "device": "RTX 2060 SUPER/595.104.02",
+  "ref": "a0d2e71+vkref",
+  "buffers": [
+    {
+      "name": "band_c0_l0_b0",
+      "stage": 1,
+      "dtype": "f32",
+      "shape": [
+        4,
+        4
+      ],
+      "file": "band_c0_l0_b0.bin",
+      "sha256": "placeholder"
+    },
+    {
+      "name": "meta-buffer",
+      "stage": 2,
+      "dtype": "u32",
+      "shape": [
+        16
+      ],
+      "file": "meta-buffer.bin",
+      "sha256": "placeholder"
+    },
+    {
+      "name": "block-stat-buffer",
+      "stage": 2,
+      "dtype": "u32",
+      "shape": [
+        256
+      ],
+      "file": "block-stat-buffer.bin",
+      "sha256": "placeholder"
+    },
+    {
+      "name": "payload-data",
+      "stage": 2,
+      "dtype": "u8",
+      "shape": [
+        32768
+      ],
+      "file": "payload-data.bin",
+      "sha256": "placeholder"
+    },
+    {
+      "name": "bucket-buffer",
+      "stage": 3,
+      "dtype": "u32",
+      "shape": [
+        1024
+      ],
+      "file": "bucket-buffer.bin",
+      "sha256": "placeholder"
+    },
+    {
+      "name": "quant-buffer",
+      "stage": 4,
+      "dtype": "u32",
+      "shape": [
+        16
+      ],
+      "file": "quant-buffer.bin",
+      "sha256": "placeholder"
+    },
+    {
+      "name": "bitstream",
+      "stage": 5,
+      "dtype": "u8",
+      "shape": [
+        32768
+      ],
+      "file": "bitstream.bin",
+      "sha256": "placeholder"
+    }
+  ]
+}

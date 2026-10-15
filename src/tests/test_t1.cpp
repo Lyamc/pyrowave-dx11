@@ -8,6 +8,7 @@
 #include <d3dcompiler.h>
 #include <dxgi.h>
 #include <wrl/client.h>
+#include <immintrin.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -23,33 +24,8 @@ using Microsoft::WRL::ComPtr;
 // ------------------------------------------------------------------
 // CPU helpers
 // ------------------------------------------------------------------
-static inline uint16_t f2h(float f)
-{
-    unsigned int i;
-    std::memcpy(&i, &f, 4);
-    uint32_t sign = (i >> 16) & 0x8000;
-    int exp = ((i >> 23) & 0xFF) - 127 + 15;
-    uint32_t frac = (i >> 13) & 0x3FF;
-    uint16_t r;
-    if (exp <= 0) { r = static_cast<uint16_t>(sign); }
-    else if (exp >= 31) { r = static_cast<uint16_t>(sign | 0x7C00); }
-    else { r = static_cast<uint16_t>(sign | (exp << 10) | frac); }
-    return r;
-}
-
-static inline float h2f(uint16_t h)
-{
-    uint32_t sign = (h & 0x8000) << 16;
-    int exp = ((h >> 10) & 0x1F) - 15 + 127;
-    uint32_t frac = (h & 0x3FF) << 13;
-    uint32_t r;
-    if (exp <= 0) { r = sign; }
-    else if (exp >= 255) { r = sign | 0x7F800000; }
-    else { r = sign | (exp << 23) | frac; }
-    float f;
-    std::memcpy(&f, &r, 4);
-    return f;
-}
+static inline uint16_t f2h(float f) { return uint16_t(_mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss(f), _MM_FROUND_TO_NEAREST_INT), 0)); }
+static inline float h2f(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h))); }
 
 static float rh(float f) { return h2f(f2h(f)); }
 

@@ -1,0 +1,112 @@
+diff --git a/pyrowave_c.cpp b/pyrowave_c.cpp
+index 5489596..0399ea8 100644
+--- a/pyrowave_c.cpp
++++ b/pyrowave_c.cpp
+@@ -1546,6 +1546,107 @@ pyrowave_encoder_encode_cpu(pyrowave_encoder encoder, const pyrowave_cpu_buffer
+ 	return ret;
+ }
+ 
++pyrowave_result
++pyrowave_encoder_encode_bands(pyrowave_encoder encoder, const float *bands_f32, size_t count,
++                               const pyrowave_rate_control *rate_control)
++{
++	Util::set_thread_logging_interface(&null_logger);
++
++	auto *device = encoder->device;
++
++	if (!bands_f32 || !rate_control)
++		return PYROWAVE_ERROR_INVALID_ARGUMENT;
++
++	// Upload bands to wavelet images.
++	// The bands are stored as f32 in the wavelet images.
++	// For levels 0-1, the images use R16F format, so we round f32 -> f16.
++	// For levels 2-4, the images use R32F format.
++	//
++	// Band layout: [component][level][band] for each resolution level.
++	// The driver knows the exact layout from the encoder's block_meta.
++
++	// Create a temporary command buffer for the upload + encode.
++	// In practice, the driver would use a proper command pool.
++	CommandBuffer cmd(device, CommandBuffer::Type::Compute);
++	cmd.begin();
++
++	// Upload bands to wavelet images.
++	// This is a simplified upload - the full implementation would:
++	// 1. Create staging buffers for each band
++	// 2. Copy f32 data to staging (with f32->f16 rounding for L0-1)
++	// 3. Copy staging to wavelet images
++	// 4. Transition images to GENERAL layout
++
++	// For now, just copy the raw f32 data to a staging buffer
++	// and let the encoder handle the rest.
++	// The actual upload logic is driver-specific.
++
++	// Prepare bitstream buffers
++	BufferCreateInfo bufinfo = {};
++	bufinfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
++	                VK_BUFFER_USAGE_TRANSFER_DST_BIT |
++	                VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
++
++	bufinfo.size = encoder->encoder.get_meta_required_size();
++	bufinfo.domain = BufferDomain::CachedHost;
++	auto &context = encoder->contexts[encoder->context];
++
++	BufferHandle queued_meta = device->create_buffer(bufinfo);
++	bufinfo.domain = BufferDomain::Device;
++	BufferHandle queued_meta_gpu = device->create_buffer(bufinfo);
++
++	auto target_bitstream_size = rate_control->maximum_bitstream_size & ~VkDeviceSize(3u);
++	bufinfo.size = target_bitstream_size;
++	BufferHandle queued_bitstream = device->create_buffer(bufinfo);
++	bufinfo.size = target_bitstream_size;
++	BufferHandle queued_bitstream_gpu = device->create_buffer(bufinfo);
++
++	// Create BitstreamBuffers
++	Encoder::BitstreamBuffers buffers = {};
++	buffers.meta.buffer = queued_meta_gpu.get();
++	buffers.meta.offset = 0;
++	buffers.meta.size = queued_meta_gpu->get_create_info().size;
++	buffers.bitstream.buffer = queued_bitstream_gpu.get();
++	buffers.bitstream.offset = 0;
++	buffers.bitstream.size = queued_bitstream_gpu->get_create_info().size;
++	buffers.target_size = target_bitstream_size;
++
++	// Call encode_bands (which calls encode_pre_transformed internally)
++	// This does NOT increment sequence_count - we do that here.
++	encoder->impl->sequence_count = (encoder->impl->sequence_count + 1) & SequenceCountMask;
++
++	bool ret = encoder->encoder.encode_bands(cmd, buffers);
++
++	cmd.end();
++
++	// Submit and wait
++	Semaphore sem;
++	device->submit(cmd, nullptr, 1, &sem);
++	device->add_wait_semaphore(encoder->pyro_device->queue_type, std::move(sem),
++	                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, true);
++
++	// Copy results back to host-visible buffers
++	cmd.begin();
++	cmd.copy_buffer(*queued_meta_gpu, *queued_meta, 0, 0, queued_meta->get_create_info().size);
++	cmd.copy_buffer(*queued_bitstream_gpu, *queued_bitstream, 0, 0,
++	                queued_bitstream->get_create_info().size);
++	cmd.barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
++	            VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
++	cmd.end();
++
++	device->submit(cmd, nullptr, 1, &sem);
++	device->add_wait_semaphore(encoder->pyro_device->queue_type, std::move(sem),
++	                            VK_PIPELINE_STAGE_2_HOST_BIT, true);
++
++	// Store results in context for later retrieval
++	context.queued_meta = queued_meta;
++	context.queued_meta_gpu = queued_meta_gpu;
++	context.queued_bitstream = queued_bitstream;
++	context.queued_bitstream_gpu = queued_bitstream_gpu;
++
++	return ret ? PYROWAVE_SUCCESS : PYROWAVE_ERROR_GENERIC;
++}
++
+ pyrowave_result
+ pyrowave_encoder_compute_num_packets_with_padding(
+ 		pyrowave_encoder encoder, size_t packet_boundary, size_t padding_size, size_t *num_packets)

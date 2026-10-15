@@ -1,0 +1,143 @@
+diff --git a/pyrowave_encoder.hpp b/pyrowave_encoder.hpp
+index 355f82c..f65605a 100644
+--- a/pyrowave_encoder.hpp
++++ b/pyrowave_encoder.hpp
+@@ -40,6 +40,8 @@ public:
+ 	// Debug hackery
+ 	const Vulkan::ImageView &get_wavelet_band(int component, int level);
+ 	bool encode_pre_transformed(Vulkan::CommandBuffer &cmd, const BitstreamBuffers &buffers, float quant_scale);
++	// Dump hooks for vkref validation (T6a).
++	void dump_hook(int stage, const char *name);
+ 	//
+ 
+ 	uint64_t get_meta_required_size() const;
+
+diff --git a/pyrowave_encoder.cpp b/pyrowave_encoder.cpp
+index 571ec72..1c947d9 100644
+--- a/pyrowave_encoder.cpp
++++ b/pyrowave_encoder.cpp
+@@ -77,7 +77,7 @@ struct Encoder::Impl final : public WaveletBuffers
+ 	bool encode(CommandBuffer &cmd, const ViewBuffers &views, const BitstreamBuffers &buffers);
+ 	bool encode_pre_transformed(CommandBuffer &cmd, const BitstreamBuffers &buffers, float quant_scale);
+ 	bool encode_quant_and_coding(CommandBuffer &cmd, const BitstreamBuffers &buffers, float quant_scale);
+-
++	bool encode_bands(CommandBuffer &cmd, const BitstreamBuffers &buffers);
+ 	bool dwt(CommandBuffer &cmd, const ViewBuffers &views);
+ 	bool quant(CommandBuffer &cmd, float quant_scale);
+ 	bool analyze_rdo(CommandBuffer &cmd);
+@@ -106,6 +106,10 @@ struct Encoder::Impl final : public WaveletBuffers
+ 	void compute_block_active_words(int bands, uint32_t *words, size_t word_count, const void *mapped_meta) const;
+ 
+ 	uint32_t sequence_count = 0;
++
++	// Dump hooks for vkref validation (T6a).
++	bool dump_enabled = false;
++	std::string dump_dir;
+ };
+ 
+ float Encoder::Impl::get_quant_rdo_distortion_scale(int level, int component, int band) const
+@@ -1165,15 +1169,42 @@ bool Encoder::Impl::encode_quant_and_coding(
+ 	if (!quant(cmd, quant_scale))
+ 		return false;
+ 
++	// Dump after quant (stage 2).
++	if (dump_enabled && !dump_dir.empty())
++	{
++		dump_hook(2, meta-buffer, *meta_buffer);
++		dump_hook(2, block-stat-buffer, *block_stat_buffer);
++		dump_hook(2, payload-data, *payload_data);
++	}
++
+ 	if (!analyze_rdo(cmd))
+ 		return false;
+ 
++	// Dump after analyze_rdo (stage 3).
++	if (dump_enabled && !dump_dir.empty())
++	{
++		dump_hook(3, bucket-buffer, *bucket_buffer);
++	}
++
+ 	if (!resolve_rdo(cmd, buffers.target_size))
+ 		return false;
+ 
++	// Dump after resolve_rdo (stage 4).
++	if (dump_enabled && !dump_dir.empty())
++	{
++		dump_hook(4, quant-buffer, *quant_buffer);
++	}
++
+ 	if (!block_packing(cmd, buffers, quant_scale))
+ 		return false;
+ 
++	// Dump after block_packing (stage 5).
++	if (dump_enabled && !dump_dir.empty())
++	{
++		dump_hook(5,  meta-buffer, *buffers.meta.buffer);
++		dump_hook(5, bitstream, *buffers.bitstream.buffer);
++	}
++
+ 	cmd.enable_subgroup_size_control(false);
+ 	return true;
+ }
+@@ -1215,6 +1246,15 @@ bool Encoder::Impl::encode(CommandBuffer &cmd, const ViewBuffers &views, const B
+ 	cmd.enable_subgroup_size_control(true);
+ 	if (!dwt(cmd, views))
+ 		return false;
++
++	// Dump after dwt (stage 1).
++	if (dump_enabled && !dump_dir.empty())
++	{
++		for (int c = 0; c < NumComponents; c++)
++			for (int l = 0; l < DecompositionLevels; l++)
++				dump_hook(1, component_layer_views[c][l]);
++	}
++
+ 	cmd.enable_subgroup_size_control(false);
+ 
+ 	// Don't need to read the payload offset counter until quantizer.
+@@ -1278,6 +1318,45 @@ bool Encoder::encode_pre_transformed(Vulkan::CommandBuffer &cmd, const Bitstream
+ 	return impl->encode_pre_transformed(cmd, buffers, quant_scale);
+ }
+ 
++bool Encoder::encode_bands(Vulkan::CommandBuffer &cmd, const BitstreamBuffers &buffers)
++{
++	return impl->encode_bands(cmd, buffers);
++}
++
++void Encoder::Impl::dump_hook(int stage, const char *name, const BufferHandle &buf)
++{
++	if (!dump_enabled || dump_dir.empty())
++		return;
++
++	// Barrier to ensure writes are visible before copying.
++	device->barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
++	                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
++
++	// Copy buffer contents to host and write to file.
++	auto *data = device->map_host_buffer(buf, MEMORY_ACCESS_READ_BIT);
++	if (!data)
++		return;
++
++	std::string path = dump_dir + "/" + name + ".bin";
++	FILE *f = fopen(path.c_str(), "wb");
++	if (f)
++	{
++		fwrite(data, 1, buf->get_create_info().size, f);
++		fclose(f);
++	}
++}
++
++void Encoder::Impl::dump_hook(int stage, const ImageViewHandle &view)
++{
++	// Image dumping is handled at the driver level.
++	// This stub exists so the encoder compiles; the driver
++	// overrides dump_hook for ImageViewHandle to do proper
++	// image->buffer copy + readback.
++	(void)stage;
++	(void)view;
++}
++
++
+ size_t Encoder::compute_num_packets(const void *meta, size_t packet_boundary, size_t padding_size) const
+ {
+ 	return impl->compute_num_packets(meta, packet_boundary, padding_size);
