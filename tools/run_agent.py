@@ -211,7 +211,9 @@ HARD_RULES = """HARD RULES (the harness enforces them; violations are reverted a
    reported as `pyrowave-d3d11` (OQ-13 = A); input YUV420P only (OQ-20); all other OQs: documented default."""
 
 WORKFLOW = """HOW TO WORK (your context window is only 32k tokens, so be frugal):
-- AGENTS.md is already in your instructions. Do not re-read it. Read other files in pieces: grep first, then read <=150 lines at a time.
+- AGENTS.md is already in your instructions. Do not re-read it. Read ONE file at a time, in pieces: grep first, then read
+  <=120 lines (the harness caps reads at 120 lines and any tool output at ~7000 chars). Never read reference/pyrowave/pyrowave.h
+  whole: grep for the struct/enum you need, then read just those lines.
 - Keep command output short: append `2>&1 | Select-Object -Last 40` to builds and tests. Your shell is Windows PowerShell 5.1.
 - Build tools: prefix MSVC/fxc/cmake/ninja commands with `tools\\devenv.cmd`, e.g.
     tools\\devenv.cmd cmake -S src -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -292,6 +294,7 @@ def run_session(tid, prompt, session_tag):
     errf = open(RUN_DIR / f"{session_tag}.stderr.txt", "w", encoding="utf-8", errors="replace")
     env = dict(os.environ)
     env["OPENCODE_CONFIG"] = str(AGENT_DIR / "opencode.json")
+    env["OPENCODE_CONFIG_DIR"] = str(AGENT_DIR / "ocdir")
     env["OPENCODE_DISABLE_AUTOUPDATE"] = "1"
     cmd = [str(OPENCODE), "run", "--format", "json", "--title", f"{tid} {session_tag}", prompt]
     log(f"=== session {session_tag} start (prompt {len(prompt)} chars)")
@@ -303,9 +306,9 @@ def run_session(tid, prompt, session_tag):
     step_t0 = [None]
 
     def reader():
-        with open(jsonl, "a", encoding="utf-8") as jf:
+        with open(jsonl, "a", encoding="utf-8", newline="") as jf:
             for raw in proc.stdout:
-                line = raw.decode("utf-8", errors="replace")
+                line = raw.decode("utf-8", errors="replace").rstrip("\r\n") + "\n"
                 jf.write(line)
                 jf.flush()
                 last_activity[0] = time.time()
