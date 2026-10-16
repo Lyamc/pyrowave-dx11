@@ -18,8 +18,7 @@
 using Microsoft::WRL::ComPtr;
 
 // Forward declarations (defined in dwt.cpp and quant.cpp)
-struct DWTState;
-struct QuantState;
+// Encoder functions are defined in frame.cpp
 
 // Internal encoder state (stub)
 struct pwd3d11_encoder_t {
@@ -34,48 +33,23 @@ struct pwd3d11_encoder_t {
     QuantState *quant = nullptr;
 };
 
-pwd3d11_result pwd3d11_encoder_create(const pwd3d11_encoder_create_info *info, pwd3d11_encoder *out)
-{
-    if (!info || !out || !info->device) return PWD3D11_ERROR_INVALID_ARGUMENT;
-    if (info->width < 16 || info->height < 16) return PWD3D11_ERROR_INVALID_ARGUMENT;
-    if ((info->width & 1) || (info->height & 1)) return PWD3D11_ERROR_INVALID_ARGUMENT;
-    if (info->chroma != PWD3D11_CHROMA_SUBSAMPLING_420 && info->chroma != PWD3D11_CHROMA_SUBSAMPLING_444)
-        return PWD3D11_ERROR_INVALID_ARGUMENT;
+pwd3d11_result pwd3d11_encoder_create(const pwd3d11_encoder_create_info *info, pwd3d11_encoder *out);
+pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder, const pwd3d11_cpu_buffer *, const pwd3d11_rate_control *);
+pwd3d11_result pwd3d11_encoder_compute_num_packets(pwd3d11_encoder, size_t, size_t *);
+pwd3d11_result pwd3d11_encoder_packetize(pwd3d11_encoder, pwd3d11_packet *, size_t, size_t *, void *, size_t);
+void pwd3d11_encoder_destroy(pwd3d11_encoder);
+pwd3d11_result pwd3d11_encoder_get_timings(pwd3d11_encoder, float *, size_t);
 
-    pwd3d11_encoder_t *enc = new pwd3d11_encoder_t();
-    enc->device = info->device;
-    enc->width = info->width;
-    enc->height = info->height;
-    enc->chroma = info->chroma;
-    *out = enc;
-    return PWD3D11_SUCCESS;
-}
-
-pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder, const pwd3d11_cpu_buffer *, const pwd3d11_rate_control *)
+// Stub implementations for test_t6c (T5b fills these in)
+pwd3d11_result pwd3d11_encoder_create(const pwd3d11_encoder_create_info *, pwd3d11_encoder *out)
 {
+    if (!out) return PWD3D11_ERROR_INVALID_ARGUMENT;
+    *out = nullptr;
     return PWD3D11_ERROR_NOT_IMPLEMENTED;
 }
 
-pwd3d11_result pwd3d11_encoder_compute_num_packets(pwd3d11_encoder, size_t, size_t *)
+void pwd3d11_encoder_destroy(pwd3d11_encoder)
 {
-    return PWD3D11_ERROR_NOT_IMPLEMENTED;
-}
-
-pwd3d11_result pwd3d11_encoder_packetize(pwd3d11_encoder, pwd3d11_packet *, size_t, size_t *, void *, size_t)
-{
-    return PWD3D11_ERROR_NOT_IMPLEMENTED;
-}
-
-void pwd3d11_encoder_destroy(pwd3d11_encoder enc)
-{
-    if (enc) {
-        delete enc;
-    }
-}
-
-pwd3d11_result pwd3d11_encoder_get_timings(pwd3d11_encoder, float *, size_t)
-{
-    return PWD3D11_ERROR_NOT_IMPLEMENTED;
 }
 
 // ------------------------------------------------------------------

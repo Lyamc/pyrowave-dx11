@@ -42,6 +42,7 @@ static_assert(sizeof(AnalyzePushConstants) == 48, "AnalyzePushConstants must be 
 // Analyze state
 // ------------------------------------------------------------------
 struct AnalyzeState {
+    ~AnalyzeState();
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     ComPtr<ID3D11ComputeShader> analyze_shader;
@@ -279,3 +280,5 @@ void analyze_destroy(AnalyzeState *st)
         if (st->context) st->context->Flush();
     }
 }
+
+AnalyzeState::~AnalyzeState() = default;

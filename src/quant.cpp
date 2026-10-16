@@ -46,6 +46,7 @@ static_assert(sizeof(QuantPushConstants) == 48, "QuantPushConstants must be 48 b
 // Quant encoder state
 // ------------------------------------------------------------------
 struct QuantState {
+    ~QuantState();
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     ComPtr<ID3D11ComputeShader> shader;
@@ -372,3 +373,5 @@ void quant_destroy(QuantState *st)
         // ComPtr handles release
     }
 }
+
+QuantState::~QuantState() = default;

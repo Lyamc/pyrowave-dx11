@@ -32,6 +32,7 @@ static_assert(sizeof(ResolvePushConstants) == 16, "ResolvePushConstants must be 
 // Resolve state
 // ------------------------------------------------------------------
 struct ResolveState {
+    ~ResolveState();
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     ComPtr<ID3D11ComputeShader> resolve_shader;
@@ -133,3 +134,5 @@ void resolve_destroy(ResolveState *st)
         if (st->context) st->context->Flush();
     }
 }
+
+ResolveState::~ResolveState() = default;

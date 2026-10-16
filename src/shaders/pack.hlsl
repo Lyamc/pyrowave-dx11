@@ -303,7 +303,7 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint g
 
     // Write code word, q byte, planes, and signs into gs_pkt
     if (active) {
-        // Header offset within packet (after word 0 and word 1)
+        // Header offset within packet (position of this 8x8 block's data)
         uint hdr_offset = countbits(gs_ballot[blk] & ((1u << local_block_index) - 1u));
 
         // Write code word (u16) at 4*base + 8 + 2*hdr_offset
@@ -318,61 +318,72 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint g
         // Write q byte (u8) at 4*base + 8 + 2*N + hdr_offset
         uint q_byte_addr = 4u * base + 8u + 2u * N + hdr_offset;
         uint q_byte = (code_word >> 16u) & 0xffu;
-        uint word_idx2 = uint(q_byte_addr) >> 2u;
-        uint byte_offset2 = uint(q_byte_addr) & 3u;
+        uint word_idx2 = q_byte_addr >> 2u;
+        uint byte_offset2 = q_byte_addr & 3u;
         uint existing2 = gs_pkt[blk * MAX_PACKET_WORDS + word_idx2];
         existing2 = (existing2 & ~(0xffu << (byte_offset2 * 8u))) | (uint(q_byte) << (byte_offset2 * 8u));
         gs_pkt[blk * MAX_PACKET_WORDS + word_idx2] = existing2;
 
-        // Copy planes and signs
-        uint in_q_bits = (code_word >> Q_PLANES_OFFSET) & 0xfu;
-        // We need meta.code_word for in_planes — reload it
-        // Actually we already have it from P1 — but it was quantized. We need the original.
-        // The original is stored in block_meta at offset 0. Let's reload.
-        // For simplicity, we'll use the quantized code_word's q_bits as a fallback
-        // (the original meta.code_word is needed for in_planes calculation)
-        //
-        // Since we don't have the original meta.code_word anymore, we need to reload it.
-        // But we're in P3 with no barrier, so we can still read from t0.
+        // Copy planes and extract significant masks for sign bits
+        // meta_cw is the ORIGINAL code word (before quantization) for in_planes
         uint meta_cw = t0.Load((block_offset_8x8 + block_stride_8x8 * block8x8_y + block8x8_x) * 8);
+        uint in_q_bits = (meta_cw >> Q_PLANES_OFFSET) & 0xfu;
+        uint out_q_bits = (code_word >> Q_PLANES_OFFSET) & 0xfu;
 
         uint in_offset = meta_offset;
         uint out_offset = plane_off;
+        uint sign_off_bits = sign_off * 8u + exclusive_sign;  // bit offset within sign region
 
         for (int sb = 0; sb < 16; sb += 2) {
-            uint out_planes = (code_word >> sb) & 3u;
-            out_planes += in_q_bits;
-            uint in_planes = (meta_cw >> sb) & 3u;
-            in_planes += ((meta_cw >> Q_PLANES_OFFSET) & 0xfu);
+            uint out_planes = ((code_word >> sb) & 3u) + out_q_bits;
+            uint in_planes = ((meta_cw >> sb) & 3u) + in_q_bits;
             if (in_planes != 0u) in_planes++;
 
             if (in_planes != 0u && in_offset + in_planes * 4u < 65536u) {
-                // Load plane data from payload buffer
-                for (uint p = 0u; p < out_planes && p < in_planes; p++) {
-                    uint src_word_idx = (in_offset + p) >> 1u;
-                    uint src_byte_in = (in_offset + p) & 1u;
-                    uint src_word = load_payload_byte(u2, src_word_idx * 4u);
-                    uint byte_val = src_word >> (src_byte_in * 8u);
-                    byte_val &= (src_byte_in == 0u) ? 0xffu : 0xff00u;
-                    byte_val >>= (src_byte_in == 0u) ? 0u : 8u;
+                // Copy plane bytes and track significant mask
+                uint significant_mask = 0u;
 
+                for (uint p = 0u; p < out_planes && p < in_planes; p++) {
+                    uint byte_idx = in_offset + p;
+                    uint src_word = load_payload_byte(u2, byte_idx);
+                    uint byte_val = (src_word >> (8u * ((byte_idx + 8u) & 3u))) & 0xffu;
+
+                    // Store in packet staging
                     uint dst_word_idx = out_offset >> 2u;
                     uint dst_byte_in = out_offset & 3u;
                     uint existing_pkt = gs_pkt[blk * MAX_PACKET_WORDS + dst_word_idx];
                     existing_pkt = (existing_pkt & ~(0xffu << (dst_byte_in * 8u))) | (byte_val << (dst_byte_in * 8u));
                     gs_pkt[blk * MAX_PACKET_WORDS + dst_word_idx] = existing_pkt;
+
+                    // Track significance: if any bit set, this byte is significant
+                    significant_mask |= byte_val;
                     out_offset++;
+                }
+
+                // Write sign bits for each set bit in significant_mask
+                // Each set bit k means coefficient k is significant
+                uint sig_mask = significant_mask;
+                while (sig_mask != 0u) {
+                    int bit_pos = firstbitlow(sig_mask);
+                    sig_mask &= sig_mask - 1u;  // Clear lowest set bit
+
+                    // Write sign bit at sign_off_bits + bit_pos
+                    uint sign_word_idx = (sign_off_bits + uint(bit_pos)) >> 5u;  // 32 bits per word
+                    uint sign_bit_in_word = (sign_off_bits + uint(bit_pos)) & 31u;
+
+                    // Read current word from staging
+                    uint pkt_word_idx = sign_word_idx >> 2u;
+                    uint pkt_byte_in = sign_word_idx & 3u;
+                    uint existing_sign = gs_pkt[blk * MAX_PACKET_WORDS + pkt_word_idx];
+
+                    // Set the bit
+                    existing_sign |= (1u << sign_bit_in_word);
+                    gs_pkt[blk * MAX_PACKET_WORDS + pkt_word_idx] = existing_sign;
                 }
             }
 
             in_offset += in_planes;
         }
-
-        // Sign bits — write directly into gs_pkt at sign_off
-        // For each significant coefficient, write 1 bit
-        // We need to re-extract significant masks from the payload
-        // This is simplified — the full implementation would extract sig masks
-        // and write bits at sign_off + bit_position
     }
 
     GroupMemoryBarrierWithGroupSync();  // B4
