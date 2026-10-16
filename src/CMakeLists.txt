@@ -160,7 +160,7 @@ target_include_directories(test_t6c PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}"
 )
 target_link_libraries(test_t6c PRIVATE d3d11 dxgi d3dcompiler crypt32)
-target_sources(test_t6c PRIVATE device.cpp c_api.cpp debug_dump.cpp)
+target_sources(test_t6c PRIVATE device.cpp c_api.cpp debug_dump.cpp dwt.cpp frame.cpp quant.cpp analyze.cpp resolve.cpp)
 set_target_properties(test_t6c PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
 )

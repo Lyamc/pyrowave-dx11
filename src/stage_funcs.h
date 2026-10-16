@@ -4,25 +4,7 @@
 #ifndef STAGE_FUNCS_H
 #define STAGE_FUNCS_H
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#include <d3d11.h>
-#include <dxgi.h>
-
-// Forward declarations with destructors (defined in respective .cpp files)
-struct DWTState {
-    ~DWTState();
-};
-struct QuantState {
-    ~QuantState();
-};
-struct AnalyzeState {
-    ~AnalyzeState();
-};
-struct ResolveState {
-    ~ResolveState();
-};
+#include "stage_internal.h"
 
 // DWT (dwt.cpp)
 pwd3d11_result dwt_create(DWTState *st, pwd3d11_device dev, int W, int H, int chroma_subsample);
@@ -37,7 +19,8 @@ void dwt_destroy(DWTState *st);
 
 // Quant (quant.cpp)
 pwd3d11_result quant_create(QuantState *st, pwd3d11_device dev, int W, int H, int chroma_subsample);
-pwd3d11_result quant_set_bands(QuantState *st, ID3D11ShaderResourceView * const *band_srvs, int num_bands);
+pwd3d11_result quant_set_bands(QuantState *st, ID3D11ShaderResourceView * const *band_srvs,
+                                 const int *band_w, const int *band_h, int num_bands);
 pwd3d11_result quant_create_outputs(QuantState *st);
 pwd3d11_result quant_compile_shader(QuantState *st);
 pwd3d11_result quant_run(QuantState *st);
@@ -48,7 +31,7 @@ pwd3d11_result analyze_create(AnalyzeState *st, ID3D11Device *dev, int W, int H,
 pwd3d11_result analyze_set_stats(AnalyzeState *st, ID3D11Buffer *stats_buffer, int total_blocks);
 pwd3d11_result analyze_create_buffers(AnalyzeState *st);
 pwd3d11_result analyze_compile_shaders(AnalyzeState *st);
-pwd3d11_result analyze_run(AnalyzeState *st, ID3D11ShaderResourceView *srv_stats,
+pwd3d11_result analyze_run(AnalyzeState *st,
                            int bw, int bh, int block_offset_8x8, int block_stride_8x8,
                            int block_offset_32x32, int block_stride_32x32);
 pwd3d11_result analyze_finalize_run(AnalyzeState *st);

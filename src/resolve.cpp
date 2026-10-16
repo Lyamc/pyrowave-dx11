@@ -14,6 +14,7 @@
 
 #include "pyrowave_d3d11.h"
 #include "debug_dump.h"
+#include "stage_internal.h"
 #include "shaders/resolve_dxbc.h"
 
 using Microsoft::WRL::ComPtr;
@@ -27,18 +28,6 @@ struct ResolvePushConstants {
     unsigned int _pad[2];                   // @8
 };
 static_assert(sizeof(ResolvePushConstants) == 16, "ResolvePushConstants must be 16 bytes");
-
-// ------------------------------------------------------------------
-// Resolve state
-// ------------------------------------------------------------------
-struct ResolveState {
-    ~ResolveState();
-    ComPtr<ID3D11Device> device;
-    ComPtr<ID3D11DeviceContext> context;
-    ComPtr<ID3D11ComputeShader> resolve_shader;
-
-    int per_sub = 0;
-};
 
 // ------------------------------------------------------------------
 // Create resolve state

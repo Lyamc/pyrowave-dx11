@@ -16,9 +16,8 @@
 #include <vector>
 
 #include "pyrowave_d3d11.h"
-
-extern const BYTE g_dwt_dxbc[];
-extern size_t g_dwt_dxbc_len;
+#include "stage_internal.h"
+#include "shaders/dwt_dxbc.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -58,7 +57,6 @@ static float rh(float f) { return h2f(f2h(f)); }
 // ------------------------------------------------------------------
 // Constants
 // ------------------------------------------------------------------
-static const int Levels = 5;
 static const float ALPHA = -1.586134342059924f;
 static const float BETA = -0.052980118572961f;
 static const float GAMMA = 0.882911075530934f;
@@ -77,18 +75,6 @@ struct PushConstants {
     float rs;
 };
 static_assert(sizeof(PushConstants) == 32, "PushConstants must be 32 bytes");
-
-// ------------------------------------------------------------------
-// Band texture descriptor
-// ------------------------------------------------------------------
-struct BandTex {
-    ComPtr<ID3D11Texture2D> tex;
-    ComPtr<ID3D11UnorderedAccessView> uav;
-    ComPtr<ID3D11ShaderResourceView> srv;
-    ComPtr<ID3D11ShaderResourceView> srv_layer0; // layer 0 only, for next level input
-    int w = 0, h = 0;
-    DXGI_FORMAT fmt;
-};
 
 // ------------------------------------------------------------------
 // Helper: create a 1-layer Texture2DArray SRV (layer 0 only)
@@ -199,31 +185,6 @@ static std::vector<float> readback_layer(const BandTex &o, int layer, ID3D11Devi
 }
 
 // ------------------------------------------------------------------
-// DWT encoder state
-// ------------------------------------------------------------------
-struct DWTState {
-    ~DWTState();
-    ComPtr<ID3D11Device> device;
-    ComPtr<ID3D11DeviceContext> context;
-    ComPtr<ID3D11ComputeShader> shader;
-    ComPtr<ID3D11SamplerState> sampler;
-
-    // Input plane textures (R8_UNORM)
-    ComPtr<ID3D11Texture2D> planes[3];
-    ComPtr<ID3D11ShaderResourceView> plane_srv[3];
-
-    // Band textures: [component][level]
-    BandTex bands[3][Levels];
-
-    // Plane dimensions
-    int pw[3], ph[3]; // physical (unpadded)
-    int aw, ah;       // aligned
-
-    int width, height;
-    int chroma; // 0 = 4:2:0, 1 = 4:4:4
-};
-
-// ------------------------------------------------------------------
 // Mirror coordinate fixup (matches generate_mirror_uv in dwt.hlsl)
 // ------------------------------------------------------------------
 static inline int mirror_coord(int i, int R)
@@ -332,9 +293,19 @@ pwd3d11_result dwt_create(DWTState *st, pwd3d11_device dev, int W, int H, int ch
 }
 
 // ------------------------------------------------------------------
+// Compile the DWT compute shader
+// ------------------------------------------------------------------
+pwd3d11_result dwt_compile_shader(DWTState *st)
+{
+    if (!st->device) return PWD3D11_ERROR_INVALID_ARGUMENT;
+    HRESULT hr = create_dwt_shader(st->device.Get(), &st->shader);
+    return SUCCEEDED(hr) ? PWD3D11_SUCCESS : PWD3D11_ERROR_GENERIC;
+}
+
+// ------------------------------------------------------------------
 // Upload input planes from CPU buffer
 // ------------------------------------------------------------------
-static pwd3d11_result dwt_upload_planes(DWTState *st, const pwd3d11_cpu_buffer *buf)
+pwd3d11_result dwt_upload_planes(DWTState *st, const pwd3d11_cpu_buffer *buf)
 {
     if (!st || !buf) return PWD3D11_ERROR_INVALID_ARGUMENT;
 
@@ -384,7 +355,7 @@ static pwd3d11_result dwt_upload_planes(DWTState *st, const pwd3d11_cpu_buffer *
 // ------------------------------------------------------------------
 // Create band output textures
 // ------------------------------------------------------------------
-static pwd3d11_result dwt_create_bands(DWTState *st)
+pwd3d11_result dwt_create_bands(DWTState *st)
 {
     for (int c = 0; c < 3; c++) {
         int start_level = (c == 0 && st->chroma == 0) ? 0 : 1; // chroma starts at level 1 for 4:2:0
@@ -402,7 +373,7 @@ static pwd3d11_result dwt_create_bands(DWTState *st)
 // ------------------------------------------------------------------
 // Run the DWT: 13 dispatches in the correct order
 // ------------------------------------------------------------------
-static pwd3d11_result dwt_run(DWTState *st)
+pwd3d11_result dwt_run(DWTState *st)
 {
     if (!st || !st->shader) return PWD3D11_ERROR_INVALID_ARGUMENT;
 
@@ -543,8 +514,7 @@ static double validate_dwt(DWTState *st, const pwd3d11_cpu_buffer *buf, bool emu
         int start_level = (c == 0 && st->chroma == 0) ? 0 : 1;
         for (int l = start_level; l < Levels; l++) {
             bool is_first = (l == start_level);
-            int rx = is_first ? st->pw[c] : prev_ll[c].w;
-            int ry = is_first ? st->ph[c] : prev_ll[c].h;
+            (void)is_first; // rx/ry were used when is_first was checked
             int ax = is_first ? ((c > 0 && st->chroma == 0) ? (st->aw >> 1) : st->aw) : prev_ll[c].w;
             int ay = is_first ? ((c > 0 && st->chroma == 0) ? (st->ah >> 1) : st->ah) : prev_ll[c].h;
 
@@ -633,10 +603,31 @@ static bool test_in1(DWTState *st)
 // ------------------------------------------------------------------
 // Free DWT state
 // ------------------------------------------------------------------
-static void dwt_destroy(DWTState *st)
+void dwt_destroy(DWTState *st)
 {
     if (st) {
         if (st->context) st->context->Flush();
         delete st;
     }
+}
+
+// ------------------------------------------------------------------
+// Accessors for band textures
+// ------------------------------------------------------------------
+ID3D11ShaderResourceView *dwt_get_band_srv(DWTState *st, int component, int level)
+{
+    if (!st || component < 0 || component >= 3 || level < 0 || level >= Levels) return nullptr;
+    return st->bands[component][level].srv.Get();
+}
+
+int dwt_get_band_w(DWTState *st, int component, int level)
+{
+    if (!st || component < 0 || component >= 3 || level < 0 || level >= Levels) return -1;
+    return st->bands[component][level].w;
+}
+
+int dwt_get_band_h(DWTState *st, int component, int level)
+{
+    if (!st || component < 0 || component >= 3 || level < 0 || level >= Levels) return -1;
+    return st->bands[component][level].h;
 }

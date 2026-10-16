@@ -1,5 +1,5 @@
 // c_api.cpp -- C ABI entry points for pyrowave_d3d11.dll
-// Stubs for encoder functions (T5b fills these in).
+// Encoder functions are implemented in frame.cpp.
 // Debug infrastructure for T6c (dump hooks + pwd3d11_debug_run_stage).
 
 #define WIN32_LEAN_AND_MEAN
@@ -14,43 +14,17 @@
 
 #include "pyrowave_d3d11.h"
 #include "debug_dump.h"
+#include "stage_internal.h"
 
 using Microsoft::WRL::ComPtr;
 
-// Forward declarations (defined in dwt.cpp and quant.cpp)
-// Encoder functions are defined in frame.cpp
-
-// Internal encoder state (stub)
-struct pwd3d11_encoder_t {
-    pwd3d11_device device;
-    int width;
-    int height;
-    pwd3d11_chroma_subsampling chroma;
-    char dump_dir[512];  // debug dump directory (T6c)
-
-    // Stage states (T1+T2b)
-    DWTState *dwt = nullptr;
-    QuantState *quant = nullptr;
-};
-
-pwd3d11_result pwd3d11_encoder_create(const pwd3d11_encoder_create_info *info, pwd3d11_encoder *out);
+// Forward declarations (defined in frame.cpp)
+pwd3d11_result pwd3d11_encoder_create(const pwd3d11_encoder_create_info *, pwd3d11_encoder *out);
 pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder, const pwd3d11_cpu_buffer *, const pwd3d11_rate_control *);
 pwd3d11_result pwd3d11_encoder_compute_num_packets(pwd3d11_encoder, size_t, size_t *);
 pwd3d11_result pwd3d11_encoder_packetize(pwd3d11_encoder, pwd3d11_packet *, size_t, size_t *, void *, size_t);
 void pwd3d11_encoder_destroy(pwd3d11_encoder);
 pwd3d11_result pwd3d11_encoder_get_timings(pwd3d11_encoder, float *, size_t);
-
-// Stub implementations for test_t6c (T5b fills these in)
-pwd3d11_result pwd3d11_encoder_create(const pwd3d11_encoder_create_info *, pwd3d11_encoder *out)
-{
-    if (!out) return PWD3D11_ERROR_INVALID_ARGUMENT;
-    *out = nullptr;
-    return PWD3D11_ERROR_NOT_IMPLEMENTED;
-}
-
-void pwd3d11_encoder_destroy(pwd3d11_encoder)
-{
-}
 
 // ------------------------------------------------------------------
 // Debug API -- T6c: pwd3d11_debug_run_stage + dump dir (VALIDATION §3.4, §5)

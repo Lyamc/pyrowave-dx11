@@ -14,6 +14,7 @@
 
 #include "pyrowave_d3d11.h"
 #include "debug_dump.h"
+#include "stage_internal.h"
 #include "shaders/analyze_dxbc.h"
 #include "shaders/analyze_finalize_dxbc.h"
 
@@ -37,34 +38,6 @@ struct AnalyzePushConstants {
     unsigned int _pad;                      // @44
 };
 static_assert(sizeof(AnalyzePushConstants) == 48, "AnalyzePushConstants must be 48 bytes");
-
-// ------------------------------------------------------------------
-// Analyze state
-// ------------------------------------------------------------------
-struct AnalyzeState {
-    ~AnalyzeState();
-    ComPtr<ID3D11Device> device;
-    ComPtr<ID3D11DeviceContext> context;
-    ComPtr<ID3D11ComputeShader> analyze_shader;
-    ComPtr<ID3D11ComputeShader> finalize_shader;
-
-    // Bucket buffer (created once per frame)
-    ComPtr<ID3D11Buffer> bucket_buf;
-    ComPtr<ID3D11UnorderedAccessView> uav_bucket;
-    size_t bucket_size = 0;
-
-    // Block stats SRV (from quant stage)
-    ComPtr<ID3D11Buffer> stats_buf;
-    ComPtr<ID3D11ShaderResourceView> srv_stats;
-
-    // Quant data buffer (for resolve stage)
-    ComPtr<ID3D11Buffer> quant_buf;
-    ComPtr<ID3D11UnorderedAccessView> uav_quant;
-
-    int aw = 0, ah = 0;
-    int chroma = 0;
-    int total_blocks_32x32 = 0;
-};
 
 // ------------------------------------------------------------------
 // Create analyze state
@@ -189,11 +162,11 @@ pwd3d11_result analyze_compile_shaders(AnalyzeState *st)
 // ------------------------------------------------------------------
 // Run analyze: one dispatch per band
 // ------------------------------------------------------------------
-pwd3d11_result analyze_run(AnalyzeState *st, ID3D11ShaderResourceView *srv_stats,
+pwd3d11_result analyze_run(AnalyzeState *st,
                            int bw, int bh, int block_offset_8x8, int block_stride_8x8,
                            int block_offset_32x32, int block_stride_32x32)
 {
-    if (!st || !st->analyze_shader || !srv_stats) return PWD3D11_ERROR_INVALID_ARGUMENT;
+    if (!st || !st->analyze_shader || !st->srv_stats) return PWD3D11_ERROR_INVALID_ARGUMENT;
 
     auto ctx = st->context;
     ID3D11ComputeShader *cs = st->analyze_shader.Get();
@@ -236,7 +209,7 @@ pwd3d11_result analyze_run(AnalyzeState *st, ID3D11ShaderResourceView *srv_stats
     ID3D11UnorderedAccessView *uavs[1] = { st->uav_bucket.Get() };
     ctx->CSSetShader(cs, nullptr, 0);
     ctx->CSSetConstantBuffers(0, 1, cb.GetAddressOf());
-    ctx->CSSetShaderResources(0, 1, &srv_stats);
+    ctx->CSSetShaderResources(0, 1, &st->srv_stats);
     ctx->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
     ctx->Dispatch(bw_32, bh_32, 1);
 

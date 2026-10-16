@@ -16,6 +16,7 @@
 
 #include "pyrowave_d3d11.h"
 #include "debug_dump.h"
+#include "stage_internal.h"
 
 #include "shaders/quant_dxbc.h"
 
@@ -41,41 +42,6 @@ struct QuantPushConstants {
     float _pad;                   // @44
 };
 static_assert(sizeof(QuantPushConstants) == 48, "QuantPushConstants must be 48 bytes");
-
-// ------------------------------------------------------------------
-// Quant encoder state
-// ------------------------------------------------------------------
-struct QuantState {
-    ~QuantState();
-    ComPtr<ID3D11Device> device;
-    ComPtr<ID3D11DeviceContext> context;
-    ComPtr<ID3D11ComputeShader> shader;
-
-    // Input: DWT band textures [component][level]
-    // bands[c][l] is a Texture2DArray with 4 layers (LL, LH, HL, HH)
-    struct BandRef {
-        ComPtr<ID3D11ShaderResourceView> srv;
-        int w = 0, h = 0;
-        int level = 0, component = 0;
-    };
-    std::vector<BandRef> bands; // [component * Levels + level]
-
-    // Band dimensions: [component][level]
-    int pw[3], ph[3]; // physical (unpadded)
-    int aw, ah;       // aligned
-    int chroma;       // 0 = 4:2:0, 1 = 4:4:4
-
-    // Output resources
-    ComPtr<ID3D11UnorderedAccessView> uav_meta;    // u0: BlockMeta (8 bytes per block)
-    ComPtr<ID3D11UnorderedAccessView> uav_stats;   // u1: BlockStats (64 bytes per block)
-    ComPtr<ID3D11UnorderedAccessView> uav_payload; // u2: payload counter + bytes
-
-    // Block counts for resource sizing
-    int total_blocks = 0;
-
-    // Payload buffer size: AW*AH*2 + padding for 4-byte alignment per group
-    size_t payload_size = 0;
-};
 
 // ------------------------------------------------------------------
 // Helper: get quant resolution for a band (R/pyrowave_encoder.cpp:148-176)
@@ -183,6 +149,8 @@ pwd3d11_result quant_create_outputs(QuantState *st)
         HRESULT hr = st->device->CreateBuffer(&bd, nullptr, &buf);
         if (FAILED(hr)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
 
+        st->meta_buf = buf;
+
         D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
         ud.Format = DXGI_FORMAT_R32_UINT;
         ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
@@ -202,6 +170,8 @@ pwd3d11_result quant_create_outputs(QuantState *st)
         ComPtr<ID3D11Buffer> buf;
         HRESULT hr = st->device->CreateBuffer(&bd, nullptr, &buf);
         if (FAILED(hr)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
+
+        st->stats_buf = buf;
 
         D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
         ud.Format = DXGI_FORMAT_R32_UINT;
@@ -224,6 +194,8 @@ pwd3d11_result quant_create_outputs(QuantState *st)
         ComPtr<ID3D11Buffer> buf;
         HRESULT hr = st->device->CreateBuffer(&bd, nullptr, &buf);
         if (FAILED(hr)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
+
+        st->payload_buf = buf;
 
         D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
         ud.Format = DXGI_FORMAT_R32_UINT;
