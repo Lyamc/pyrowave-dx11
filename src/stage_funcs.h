@@ -25,7 +25,7 @@ struct ResolveState {
 };
 
 // DWT (dwt.cpp)
-pwd3d11_result dwt_create(DWTState *st, void *d3d11_device, int W, int H, int chroma_subsample);
+pwd3d11_result dwt_create(DWTState *st, pwd3d11_device dev, int W, int H, int chroma_subsample);
 pwd3d11_result dwt_upload_planes(DWTState *st, const pwd3d11_cpu_buffer *buf);
 pwd3d11_result dwt_create_bands(DWTState *st);
 pwd3d11_result dwt_compile_shader(DWTState *st);
@@ -36,7 +36,7 @@ int dwt_get_band_h(DWTState *st, int component, int level);
 void dwt_destroy(DWTState *st);
 
 // Quant (quant.cpp)
-pwd3d11_result quant_create(QuantState *st, void *d3d11_device, int W, int H, int chroma_subsample);
+pwd3d11_result quant_create(QuantState *st, pwd3d11_device dev, int W, int H, int chroma_subsample);
 pwd3d11_result quant_set_bands(QuantState *st, ID3D11ShaderResourceView * const *band_srvs, int num_bands);
 pwd3d11_result quant_create_outputs(QuantState *st);
 pwd3d11_result quant_compile_shader(QuantState *st);

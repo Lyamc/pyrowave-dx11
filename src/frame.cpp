@@ -132,7 +132,7 @@ pwd3d11_result pwd3d11_encoder_create(const pwd3d11_encoder_create_info *info, p
 
     // Create DWT state
     enc->dwt = new DWTState();
-    pwd3d11_result hr = dwt_create(enc->dwt, enc->d3d11_device.Get(),
+    pwd3d11_result hr = dwt_create(enc->dwt, enc->device,
                                      info->width, info->height, info->chroma);
     if (hr != PWD3D11_SUCCESS) {
         delete enc->dwt;
@@ -143,7 +143,7 @@ pwd3d11_result pwd3d11_encoder_create(const pwd3d11_encoder_create_info *info, p
 
     // Create Quant state
     enc->quant = new QuantState();
-    hr = quant_create(enc->quant, enc->d3d11_device.Get(),
+    hr = quant_create(enc->quant, enc->device,
                        info->width, info->height, info->chroma);
     if (hr != PWD3D11_SUCCESS) {
         dwt_destroy(enc->dwt);

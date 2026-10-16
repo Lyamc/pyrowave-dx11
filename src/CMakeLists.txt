@@ -59,6 +59,8 @@ add_library(pyrowave_d3d11 SHARED
     device.cpp
     c_api.cpp
     debug_dump.cpp
+    dwt.cpp
+    frame.cpp
     quant.cpp
     analyze.cpp
     resolve.cpp
@@ -72,6 +74,7 @@ add_library(pyrowave_d3d11 SHARED
 )
 target_include_directories(pyrowave_d3d11 PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_BINARY_DIR}"
 )
 target_link_libraries(pyrowave_d3d11 PRIVATE d3d11 dxgi crypt32 d3dcompiler)
@@ -88,6 +91,8 @@ add_library(pyrowave_d3d11_static STATIC
     device.cpp
     c_api.cpp
     debug_dump.cpp
+    dwt.cpp
+    frame.cpp
     quant.cpp
     analyze.cpp
     resolve.cpp
@@ -101,6 +106,7 @@ add_library(pyrowave_d3d11_static STATIC
 )
 target_include_directories(pyrowave_d3d11_static PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_BINARY_DIR}"
 )
 target_link_libraries(pyrowave_d3d11_static PRIVATE d3d11 dxgi crypt32 d3dcompiler)

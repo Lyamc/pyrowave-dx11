@@ -93,7 +93,7 @@ struct BandTex {
 // ------------------------------------------------------------------
 // Helper: create a 1-layer Texture2DArray SRV (layer 0 only)
 // ------------------------------------------------------------------
-static ComPtr<ID3D11ShaderResourceView> make_srv_array1_layer0(ID3D11Texture2D *t, DXGI_FORMAT f, int array_size)
+static ComPtr<ID3D11ShaderResourceView> make_srv_array1_layer0(ID3D11Device *dev, ID3D11Texture2D *t, DXGI_FORMAT f, int /*array_size*/)
 {
     D3D11_SHADER_RESOURCE_VIEW_DESC d = {};
     d.Format = f;
@@ -102,14 +102,14 @@ static ComPtr<ID3D11ShaderResourceView> make_srv_array1_layer0(ID3D11Texture2D *
     d.Texture2DArray.FirstArraySlice = 0;
     d.Texture2DArray.ArraySize = 1;
     ComPtr<ID3D11ShaderResourceView> v;
-    HRESULT hr = t->GetDevice()->CreateShaderResourceView(t, &d, &v);
+    HRESULT hr = dev->CreateShaderResourceView(t, &d, &v);
     return (SUCCEEDED(hr)) ? v : ComPtr<ID3D11ShaderResourceView>();
 }
 
 // ------------------------------------------------------------------
 // Helper: create a 4-layer band texture + UAV + SRV
 // ------------------------------------------------------------------
-static BandTex make_band(int w, int h, DXGI_FORMAT f)
+static BandTex make_band(ID3D11Device *dev, int w, int h, DXGI_FORMAT f)
 {
     BandTex o;
     o.w = w; o.h = h; o.fmt = f;
@@ -120,7 +120,7 @@ static BandTex make_band(int w, int h, DXGI_FORMAT f)
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
 
-    HRESULT hr = o.tex.GetDevice()->CreateTexture2D(&td, nullptr, &o.tex);
+    HRESULT hr = dev->CreateTexture2D(&td, nullptr, &o.tex);
     if (FAILED(hr)) return BandTex{};
 
     D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
@@ -130,7 +130,7 @@ static BandTex make_band(int w, int h, DXGI_FORMAT f)
     ud.Texture2DArray.FirstArraySlice = 0;
     ud.Texture2DArray.ArraySize = 4;
 
-    hr = o.tex->CreateUnorderedAccessView(nullptr, &ud, &o.uav);
+    hr = dev->CreateUnorderedAccessView(o.tex.Get(), &ud, &o.uav);
     if (FAILED(hr)) return BandTex{};
 
     D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
@@ -140,15 +140,13 @@ static BandTex make_band(int w, int h, DXGI_FORMAT f)
     sd.Texture2DArray.FirstArraySlice = 0;
     sd.Texture2DArray.ArraySize = 4;
 
-    hr = o.tex->CreateShaderResourceView(nullptr, &sd, &o.srv);
+    hr = dev->CreateShaderResourceView(o.tex.Get(), &sd, &o.srv);
     if (FAILED(hr)) return BandTex{};
 
     // Layer 0 only SRV for next level input
-    hr = o.tex->CreateShaderResourceView(nullptr, &sd, &o.srv_layer0);
-    // Override to only layer 0
     D3D11_SHADER_RESOURCE_VIEW_DESC sd0 = sd;
     sd0.Texture2DArray.ArraySize = 1;
-    o.tex->CreateShaderResourceView(nullptr, &sd0, &o.srv_layer0);
+    hr = dev->CreateShaderResourceView(o.tex.Get(), &sd0, &o.srv_layer0);
 
     return o;
 }
@@ -156,7 +154,7 @@ static BandTex make_band(int w, int h, DXGI_FORMAT f)
 // ------------------------------------------------------------------
 // Helper: read back one band layer
 // ------------------------------------------------------------------
-static std::vector<float> readback_layer(const BandTex &o, int layer)
+static std::vector<float> readback_layer(const BandTex &o, int layer, ID3D11Device *dev)
 {
     D3D11_TEXTURE2D_DESC td;
     o.tex->GetDesc(&td);
@@ -169,12 +167,9 @@ static std::vector<float> readback_layer(const BandTex &o, int layer)
     st_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 
     ComPtr<ID3D11Texture2D> st;
-    HRESULT hr = o.tex.GetDevice()->CreateTexture2D(&st_desc, nullptr, &st);
+    HRESULT hr = dev->CreateTexture2D(&st_desc, nullptr, &st);
     if (FAILED(hr)) return {};
 
-    // Get device context from the device
-    ComPtr<ID3D11Device> dev;
-    o.tex->GetDevice(&dev);
     ComPtr<ID3D11DeviceContext> ctx;
     dev->GetImmediateContext(&ctx);
 
@@ -207,6 +202,7 @@ static std::vector<float> readback_layer(const BandTex &o, int layer)
 // DWT encoder state
 // ------------------------------------------------------------------
 struct DWTState {
+    ~DWTState();
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     ComPtr<ID3D11ComputeShader> shader;
@@ -307,22 +303,8 @@ static RefBands ref_level(const RefPlane &src, int Aw, int Ah, bool dc, bool emu
 // ------------------------------------------------------------------
 static HRESULT create_dwt_shader(ID3D11Device *dev, ID3D11ComputeShader **out)
 {
-    HRESULT hr = D3D11CreateFunctionLayerFromBlob(
-        const_cast<unsigned char*>(g_dwt_dxbc),
-        g_dwt_dxbc_len,
-        nullptr,
-        nullptr,
-        0,
-        nullptr,
-        nullptr,
-        nullptr,
-        0,
-        nullptr
-    );
-
     // Fallback: use the embedded bytecode directly
-    hr = dev->CreateComputeShader(g_dwt_dxbc, g_dwt_dxbc_len, nullptr, out);
-    return hr;
+    return dev->CreateComputeShader(g_dwt_dxbc, g_dwt_dxbc_len, nullptr, out);
 }
 
 // ------------------------------------------------------------------
@@ -333,33 +315,18 @@ DWTState::~DWTState() = default;
 // ------------------------------------------------------------------
 // Create DWT state: upload planes, create band textures, compile shader
 // ------------------------------------------------------------------
-static pwd3d11_result dwt_create(DWTState *st, pwd3d11_device dev, int W, int H, int chroma_subsample)
+pwd3d11_result dwt_create(DWTState *st, pwd3d11_device dev, int W, int H, int chroma_subsample)
 {
+    if (!dev) return PWD3D11_ERROR_INVALID_ARGUMENT;
+
     st->width = W;
     st->height = H;
     st->chroma = chroma_subsample;
 
-    // Get device and context from the pwd3d11_device
-    // The device struct contains ComPtr<ID3D11Device>
-    // We need to cast to get the internal device
-    // pwd3d11_device_t is defined in device.cpp, so we use the public interface
-    // For now, we store the device pointer and cast internally
-    // Actually, we need to get the device from the device struct
-
-    // Get the device from pwd3d11_device
-    // The pwd3d11_device is a pointer to pwd3d11_device_t which has device, context members
-    // We need to include device.cpp internals or pass the device differently
-    // For now, let's use a different approach: store ComPtr<ID3D11Device> in DWTState
-
-    // The pwd3d11_device_t struct is in device.cpp. We can't access it directly from dwt.cpp
-    // without exposing the internal struct. Let's use a different approach:
-    // Store the device context pointer and query from there.
-
-    // Actually, looking at the design, pwd3d11_device_t has ComPtr<ID3D11Device> device
-    // We need to expose a way to get it. For now, let's add a function to device.cpp.
-
-    // For the test, we'll create the DWT state directly with a device pointer.
-    // The c_api.cpp will bridge between pwd3d11_device and DWTState.
+    // Get D3D11 device from pwd3d11_device
+    st->device = static_cast<ID3D11Device*>(pwd3d11_device_get_d3d11_device(dev));
+    if (!st->device) return PWD3D11_ERROR_INVALID_ARGUMENT;
+    st->device->GetImmediateContext(&st->context);
 
     return PWD3D11_SUCCESS;
 }
@@ -397,7 +364,7 @@ static pwd3d11_result dwt_upload_planes(DWTState *st, const pwd3d11_cpu_buffer *
         sd.pSysMem = buf->data[c];
         sd.SysMemPitch = static_cast<UINT>(buf->row_stride_in_bytes[c]);
 
-        HRESULT hr = st->planes[c].GetDevice()->CreateTexture2D(&td, &sd, &st->planes[c]);
+        HRESULT hr = st->device->CreateTexture2D(&td, &sd, &st->planes[c]);
         if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
 
         // Create SRV as Texture2DArray with ArraySize=1
@@ -407,7 +374,7 @@ static pwd3d11_result dwt_upload_planes(DWTState *st, const pwd3d11_cpu_buffer *
         sd_desc.Texture2DArray.MipLevels = 1;
         sd_desc.Texture2DArray.ArraySize = 1;
 
-        hr = st->planes[c]->CreateShaderResourceView(nullptr, &sd_desc, &st->plane_srv[c]);
+        hr = st->device->CreateShaderResourceView(st->planes[c].Get(), &sd_desc, &st->plane_srv[c]);
         if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
     }
 
@@ -425,7 +392,7 @@ static pwd3d11_result dwt_create_bands(DWTState *st)
             int bw = st->aw >> (l + 1);
             int bh = st->ah >> (l + 1);
             DXGI_FORMAT fmt = (l < 2) ? DXGI_FORMAT_R16_FLOAT : DXGI_FORMAT_R32_FLOAT;
-            st->bands[c][l] = make_band(bw, bh, fmt);
+            st->bands[c][l] = make_band(st->device.Get(), bw, bh, fmt);
             if (!st->bands[c][l].tex) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
         }
     }
@@ -544,7 +511,7 @@ static std::vector<std::vector<float>> dwt_readback(DWTState *st)
         int start_level = (c == 0 && st->chroma == 0) ? 0 : 1;
         for (int l = start_level; l < Levels; l++) {
             for (int b = 0; b < 4; b++) {
-                auto layer = readback_layer(st->bands[c][l], b);
+                auto layer = readback_layer(st->bands[c][l], b, st->device.Get());
                 result[c * Levels + l].insert(result[c * Levels + l].end(), layer.begin(), layer.end());
             }
         }
@@ -585,7 +552,7 @@ static double validate_dwt(DWTState *st, const pwd3d11_cpu_buffer *buf, bool emu
 
             // Read back GPU output for this level
             for (int b = 0; b < 4; b++) {
-                auto gpu_layer = readback_layer(st->bands[c][l], b);
+                auto gpu_layer = readback_layer(st->bands[c][l], b, st->device.Get());
                 size_t n = size_t(ref.b[b].w) * ref.b[b].h;
                 for (size_t i = 0; i < n && i < gpu_layer.size(); i++) {
                     double err = std::fabs(double(gpu_layer[i] - ref.b[b].d[i]));
@@ -630,7 +597,7 @@ static bool test_in1(DWTState *st)
     sd_desc.Texture2DArray.ArraySize = 1;
 
     ComPtr<ID3D11ShaderResourceView> srv;
-    hr = test_tex->CreateShaderResourceView(nullptr, &sd_desc, &srv);
+    hr = st->device->CreateShaderResourceView(test_tex.Get(), &sd_desc, &srv);
     if (FAILED(hr)) return false;
 
     // Use a simple compute shader to sample all 256 values via Gather
@@ -652,7 +619,7 @@ static bool test_in1(DWTState *st)
     D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
     ud.Format = DXGI_FORMAT_R32_FLOAT;
     ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-    hr = uav_tex->CreateUnorderedAccessView(nullptr, &ud, &uav);
+    hr = st->device->CreateUnorderedAccessView(uav_tex.Get(), &ud, &uav);
     if (FAILED(hr)) return false;
 
     // Create a simple test shader that samples each texel
