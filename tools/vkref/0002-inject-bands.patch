@@ -1,112 +1,432 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ac881d8..2b7dc9c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -132,6 +132,10 @@ if (${PROJECT_IS_TOP_LEVEL})
+     target_link_libraries(pyrowave-c-test PRIVATE pyrowave-shared granite-volk-headers)
+     target_compile_options(pyrowave-c-test PRIVATE ${PYROWAVE_CXX_FLAGS})
+ 
++    add_executable(pyrowave-vkref-driver vkref_driver.cpp)
++    target_link_libraries(pyrowave-vkref-driver PRIVATE pyrowave-shared granite-volk-headers)
++    target_compile_options(pyrowave-vkref-driver PRIVATE ${PYROWAVE_CXX_FLAGS})
++
+     add_executable(pyrowave-c-interop-test pyrowave_c_interop_test.cpp com_ptr.hpp)
+     target_link_libraries(pyrowave-c-interop-test PRIVATE pyrowave-shared granite-vulkan)
+     target_compile_options(pyrowave-c-interop-test PRIVATE ${PYROWAVE_CXX_FLAGS})
+diff --git a/pyrowave.h b/pyrowave.h
+index c085ea5..92ad140 100644
+--- a/pyrowave.h
++++ b/pyrowave.h
+@@ -566,6 +566,16 @@ pyrowave_encoder_encode_cpu(pyrowave_encoder encoder, const pyrowave_cpu_buffer
+ PYROWAVE_PUBLIC_API void
+ pyrowave_encoder_set_dump_dir(pyrowave_encoder encoder, const char *directory, const char *vector_name);
+ 
++// VALIDATION §3.3. bands_f32 layout: for component c in [0, 3), level l in [0, 5), band b in [0, 4),
++// row-major float32 with dimensions (aligned_extent >> (l + 1)) and no padding between bands.
++// aligned_extent = max(align_up(size, 32), 128). count is the sum of those texel counts.
++// Levels 0 and 1 are stored as R16F, round-to-nearest-even. Levels 2..4 are stored as R32F.
++// Runs quant through block packing with quant scale -1 and advances the sequence counter
++// the same way pyrowave_encoder_encode_cpu does. A command buffer must not be set on the device.
++PYROWAVE_PUBLIC_API pyrowave_result
++pyrowave_encoder_encode_bands(pyrowave_encoder encoder, const float *bands_f32, size_t count,
++                              const pyrowave_rate_control *rate_control);
++
+ // Can only be called after a successful encoding operation and result is only valid for that particular frame.
+ // Computes the number of network packets required if each packet can consume a provided number of bytes.
+ PYROWAVE_PUBLIC_API pyrowave_result
 diff --git a/pyrowave_c.cpp b/pyrowave_c.cpp
-index 5489596..0399ea8 100644
+index 005d41f..1c96eec 100644
 --- a/pyrowave_c.cpp
 +++ b/pyrowave_c.cpp
-@@ -1546,6 +1546,107 @@ pyrowave_encoder_encode_cpu(pyrowave_encoder encoder, const pyrowave_cpu_buffer
- 	return ret;
+@@ -1609,6 +1609,24 @@ void pyrowave_encoder_set_dump_dir(pyrowave_encoder encoder, const char *directo
+ 	encoder->encoder.set_dump_dir(directory, vector_name ? vector_name : "", device_name);
  }
  
 +pyrowave_result
 +pyrowave_encoder_encode_bands(pyrowave_encoder encoder, const float *bands_f32, size_t count,
-+                               const pyrowave_rate_control *rate_control)
++                              const pyrowave_rate_control *rate_control)
 +{
 +	Util::set_thread_logging_interface(&null_logger);
-+
-+	auto *device = encoder->device;
-+
-+	if (!bands_f32 || !rate_control)
++	if (!encoder || !bands_f32 || !rate_control)
++		return PYROWAVE_ERROR_INVALID_ARGUMENT;
++	if (encoder->pyro_device->cmd)
 +		return PYROWAVE_ERROR_INVALID_ARGUMENT;
 +
-+	// Upload bands to wavelet images.
-+	// The bands are stored as f32 in the wavelet images.
-+	// For levels 0-1, the images use R16F format, so we round f32 -> f16.
-+	// For levels 2-4, the images use R32F format.
-+	//
-+	// Band layout: [component][level][band] for each resolution level.
-+	// The driver knows the exact layout from the encoder's block_meta.
-+
-+	// Create a temporary command buffer for the upload + encode.
-+	// In practice, the driver would use a proper command pool.
-+	CommandBuffer cmd(device, CommandBuffer::Type::Compute);
-+	cmd.begin();
-+
-+	// Upload bands to wavelet images.
-+	// This is a simplified upload - the full implementation would:
-+	// 1. Create staging buffers for each band
-+	// 2. Copy f32 data to staging (with f32->f16 rounding for L0-1)
-+	// 3. Copy staging to wavelet images
-+	// 4. Transition images to GENERAL layout
-+
-+	// For now, just copy the raw f32 data to a staging buffer
-+	// and let the encoder handle the rest.
-+	// The actual upload logic is driver-specific.
-+
-+	// Prepare bitstream buffers
-+	BufferCreateInfo bufinfo = {};
-+	bufinfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-+	                VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-+	                VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-+
-+	bufinfo.size = encoder->encoder.get_meta_required_size();
-+	bufinfo.domain = BufferDomain::CachedHost;
-+	auto &context = encoder->contexts[encoder->context];
-+
-+	BufferHandle queued_meta = device->create_buffer(bufinfo);
-+	bufinfo.domain = BufferDomain::Device;
-+	BufferHandle queued_meta_gpu = device->create_buffer(bufinfo);
-+
-+	auto target_bitstream_size = rate_control->maximum_bitstream_size & ~VkDeviceSize(3u);
-+	bufinfo.size = target_bitstream_size;
-+	BufferHandle queued_bitstream = device->create_buffer(bufinfo);
-+	bufinfo.size = target_bitstream_size;
-+	BufferHandle queued_bitstream_gpu = device->create_buffer(bufinfo);
-+
-+	// Create BitstreamBuffers
-+	Encoder::BitstreamBuffers buffers = {};
-+	buffers.meta.buffer = queued_meta_gpu.get();
-+	buffers.meta.offset = 0;
-+	buffers.meta.size = queued_meta_gpu->get_create_info().size;
-+	buffers.bitstream.buffer = queued_bitstream_gpu.get();
-+	buffers.bitstream.offset = 0;
-+	buffers.bitstream.size = queued_bitstream_gpu->get_create_info().size;
-+	buffers.target_size = target_bitstream_size;
-+
-+	// Call encode_bands (which calls encode_pre_transformed internally)
-+	// This does NOT increment sequence_count - we do that here.
-+	encoder->impl->sequence_count = (encoder->impl->sequence_count + 1) & SequenceCountMask;
-+
-+	bool ret = encoder->encoder.encode_bands(cmd, buffers);
-+
-+	cmd.end();
-+
-+	// Submit and wait
-+	Semaphore sem;
-+	device->submit(cmd, nullptr, 1, &sem);
-+	device->add_wait_semaphore(encoder->pyro_device->queue_type, std::move(sem),
-+	                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, true);
-+
-+	// Copy results back to host-visible buffers
-+	cmd.begin();
-+	cmd.copy_buffer(*queued_meta_gpu, *queued_meta, 0, 0, queued_meta->get_create_info().size);
-+	cmd.copy_buffer(*queued_bitstream_gpu, *queued_bitstream, 0, 0,
-+	                queued_bitstream->get_create_info().size);
-+	cmd.barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-+	            VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
-+	cmd.end();
-+
-+	device->submit(cmd, nullptr, 1, &sem);
-+	device->add_wait_semaphore(encoder->pyro_device->queue_type, std::move(sem),
-+	                            VK_PIPELINE_STAGE_2_HOST_BIT, true);
-+
-+	// Store results in context for later retrieval
-+	context.queued_meta = queued_meta;
-+	context.queued_meta_gpu = queued_meta_gpu;
-+	context.queued_bitstream = queued_bitstream;
-+	context.queued_bitstream_gpu = queued_bitstream_gpu;
-+
-+	return ret ? PYROWAVE_SUCCESS : PYROWAVE_ERROR_GENERIC;
++	encoder->device->next_frame_context();
++	return pyrowave_encoder_record_and_submit(
++			encoder, nullptr, nullptr, rate_control,
++			[&](CommandBuffer &cmd, const Encoder::BitstreamBuffers &buffers) {
++				return encoder->encoder.encode_bands(cmd, bands_f32, count, buffers);
++			});
 +}
 +
  pyrowave_result
  pyrowave_encoder_compute_num_packets_with_padding(
  		pyrowave_encoder encoder, size_t packet_boundary, size_t padding_size, size_t *num_packets)
+diff --git a/pyrowave_encoder.cpp b/pyrowave_encoder.cpp
+index 73efe6d..85fe6e9 100644
+--- a/pyrowave_encoder.cpp
++++ b/pyrowave_encoder.cpp
+@@ -130,6 +130,8 @@ struct Encoder::Impl final : public WaveletBuffers
+ 	bool dump_enabled() const;
+ 	bool finish_dump();
+ 	void abandon_dump();
++	size_t expected_band_floats() const;
++	bool encode_bands(CommandBuffer &cmd, const float *bands_f32, size_t count, const BitstreamBuffers &buffers);
+ 
+ 	struct DumpSlot
+ 	{
+@@ -1754,6 +1756,165 @@ bool Encoder::Impl::finish_dump()
+ 	return true;
+ }
+ 
++// Round-to-nearest-even f32 -> f16, matching HLSL f32tof16 / _mm_cvtps_ph(NEAREST).
++static uint16_t float_to_half_rtne(float value)
++{
++	uint32_t x;
++	memcpy(&x, &value, sizeof(x));
++	uint32_t sign = (x >> 16) & 0x8000u;
++	uint32_t mant = x & 0x007fffffu;
++	uint32_t exp = (x >> 23) & 0xffu;
++
++	if (exp == 255u)
++	{
++		if (mant == 0)
++			return uint16_t(sign | 0x7c00u);
++		uint32_t nan_mant = mant >> 13;
++		if (nan_mant == 0)
++			nan_mant = 1;
++		return uint16_t(sign | 0x7c00u | nan_mant);
++	}
++	if (exp == 0)
++		return uint16_t(sign);
++
++	int exp_un = int(exp) - 127;
++	if (exp_un > 15)
++		return uint16_t(sign | 0x7c00u);
++	if (exp_un < -14)
++	{
++		uint32_t sig = mant | 0x800000u;
++		int shift = 13 + (-14 - exp_un);
++		if (shift >= 25)
++			return uint16_t(sign);
++		if (shift == 24)
++			return uint16_t(sign | (sig > 0x800000u ? 1u : 0u));
++		uint32_t half = 1u << (shift - 1);
++		uint32_t rem = sig & ((1u << shift) - 1u);
++		uint32_t base = sig >> shift;
++		if (rem > half || (rem == half && (base & 1u)))
++			base++;
++		return uint16_t(sign | base);
++	}
++
++	int new_exp = exp_un + 15;
++	uint32_t rem = mant & 0x1fffu;
++	uint32_t base = mant >> 13;
++	if (rem > 0x1000u || (rem == 0x1000u && (base & 1u)))
++	{
++		base++;
++		if (base == 0x400u)
++		{
++			base = 0;
++			new_exp++;
++			if (new_exp >= 31)
++				return uint16_t(sign | 0x7c00u);
++		}
++	}
++	return uint16_t(sign | (uint32_t(new_exp) << 10) | base);
++}
++
++size_t Encoder::Impl::expected_band_floats() const
++{
++	size_t count = 0;
++	for (int level = 0; level < DecompositionLevels; level++)
++	{
++		int band_w = aligned_width >> (level + 1);
++		int band_h = aligned_height >> (level + 1);
++		if (band_w < 1)
++			band_w = 1;
++		if (band_h < 1)
++			band_h = 1;
++		count += size_t(NumComponents) * size_t(NumFrequencyBandsPerLevel) * size_t(band_w) * size_t(band_h);
++	}
++	return count;
++}
++
++bool Encoder::Impl::encode_bands(CommandBuffer &cmd, const float *bands_f32, size_t count,
++                                 const BitstreamBuffers &buffers)
++{
++	if (!bands_f32 || count != expected_band_floats())
++		return false;
++
++	for (int component = 0; component < NumComponents; component++)
++	{
++		for (int level = 0; level < DecompositionLevels; level++)
++		{
++			const ImageView &view = *component_layer_views[component][level];
++			int band_w = aligned_width >> (level + 1);
++			int band_h = aligned_height >> (level + 1);
++			if (band_w < 1)
++				band_w = 1;
++			if (band_h < 1)
++				band_h = 1;
++			if (int(view.get_view_width()) != band_w || int(view.get_view_height()) != band_h)
++				return false;
++		}
++	}
++
++	// encode() increments before any GPU work. encode_pre_transformed does not.
++	sequence_count = (sequence_count + 1) & SequenceCountMask;
++	if (!dump_directory.empty())
++		reset_dump_slots();
++
++	auto to_transfer = [&](const Image &image) {
++		cmd.image_barrier(image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
++		                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
++		                  VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
++	};
++	to_transfer(*wavelet_img_high_res);
++	if (wavelet_img_low_res)
++		to_transfer(*wavelet_img_low_res);
++
++	const float *cursor = bands_f32;
++	for (int component = 0; component < NumComponents; component++)
++	{
++		for (int level = 0; level < DecompositionLevels; level++)
++		{
++			const ImageView &view = *component_layer_views[component][level];
++			unsigned band_w = view.get_view_width();
++			unsigned band_h = view.get_view_height();
++			bool store_f16 = view.get_format() == VK_FORMAT_R16_SFLOAT;
++			for (int band = 0; band < NumFrequencyBandsPerLevel; band++)
++			{
++				VkImageSubresourceLayers sub = {};
++				sub.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++				sub.mipLevel = view.get_create_info().base_level;
++				sub.baseArrayLayer = view.get_create_info().base_layer + unsigned(band);
++				sub.layerCount = 1;
++				VkOffset3D image_offset = { 0, 0, 0 };
++				VkExtent3D image_extent = { band_w, band_h, 1 };
++				void *dst = cmd.update_image(view.get_image(), image_offset, image_extent, band_w, band_h, sub);
++				if (!dst)
++					return false;
++
++				size_t texels = size_t(band_w) * band_h;
++				if (store_f16)
++				{
++					auto *out = static_cast<uint16_t *>(dst);
++					for (size_t i = 0; i < texels; i++)
++						out[i] = float_to_half_rtne(cursor[i]);
++				}
++				else
++				{
++					memcpy(dst, cursor, texels * sizeof(float));
++				}
++				cursor += texels;
++			}
++		}
++	}
++
++	cmd.barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++	            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
++
++	return encode_pre_transformed(cmd, buffers, -1.0f);
++}
++
++bool Encoder::encode_bands(Vulkan::CommandBuffer &cmd, const float *bands_f32, size_t count,
++                           const BitstreamBuffers &buffers)
++{
++	return impl->encode_bands(cmd, bands_f32, count, buffers);
++}
++
+ void Encoder::set_dump_dir(const char *directory, const char *vector_name, const char *device_name)
+ {
+ 	impl->set_dump_dir(directory, vector_name, device_name);
+diff --git a/pyrowave_encoder.hpp b/pyrowave_encoder.hpp
+index f53d7c7..64e6e1e 100644
+--- a/pyrowave_encoder.hpp
++++ b/pyrowave_encoder.hpp
+@@ -50,6 +50,14 @@ public:
+ 	bool finish_dump();
+ 	void abandon_dump();
+ 
++	// VALIDATION §3.3. bands_f32 is tightly packed: for component, level, band,
++	// row-major f32 of (aligned_extent >> (level + 1)), no padding.
++	// aligned_extent = max(align(size, 32), 128). Levels 0-1 are stored R16F
++	// round-to-nearest-even; levels 2-4 stay R32F. Quant scale is -1.
++	// sequence_count advances the same way encode() does.
++	bool encode_bands(Vulkan::CommandBuffer &cmd, const float *bands_f32, size_t count,
++	                  const BitstreamBuffers &buffers);
++
+ 	uint64_t get_meta_required_size() const;
+ 
+ 	struct Packet
+diff --git a/vkref_driver.cpp b/vkref_driver.cpp
+new file mode 100644
+index 0000000..b34f7cd
+--- /dev/null
++++ b/vkref_driver.cpp
+@@ -0,0 +1,163 @@
++// vkref_driver: one Vulkan encode of a YUV420P frame from tools/genvectors.py.
++// Links the patched pyrowave C API. Does not generate pixels itself.
++
++#include <vulkan/vulkan.h>
++#include "pyrowave.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++static void usage(void)
++{
++	fprintf(stderr,
++	        "usage: pyrowave-vkref-driver --yuv FILE --width W --height H --vector NAME\n"
++	        "       --budget BYTES --dump-dir DIR --dump on|off\n"
++	        "\n"
++	        "The YUV file is one YUV420P frame written by tools/genvectors.py\n"
++	        "(Y plane, then Cb, then Cr, no header). --dump off leaves DIR empty.\n");
++}
++
++static const char *need_arg(int *i, int argc, char **argv)
++{
++	if (*i + 1 >= argc)
++	{
++		fprintf(stderr, "missing value after %s\n", argv[*i]);
++		exit(2);
++	}
++	*i += 1;
++	return argv[*i];
++}
++
++int main(int argc, char **argv)
++{
++	const char *yuv_path = NULL;
++	const char *vector_name = NULL;
++	const char *dump_dir = NULL;
++	const char *dump_mode = NULL;
++	int width = 0;
++	int height = 0;
++	unsigned long long budget = 0;
++
++	for (int i = 1; i < argc; i++)
++	{
++		if (strcmp(argv[i], "--yuv") == 0)
++			yuv_path = need_arg(&i, argc, argv);
++		else if (strcmp(argv[i], "--width") == 0)
++			width = atoi(need_arg(&i, argc, argv));
++		else if (strcmp(argv[i], "--height") == 0)
++			height = atoi(need_arg(&i, argc, argv));
++		else if (strcmp(argv[i], "--vector") == 0)
++			vector_name = need_arg(&i, argc, argv);
++		else if (strcmp(argv[i], "--budget") == 0)
++			budget = strtoull(need_arg(&i, argc, argv), NULL, 10);
++		else if (strcmp(argv[i], "--dump-dir") == 0)
++			dump_dir = need_arg(&i, argc, argv);
++		else if (strcmp(argv[i], "--dump") == 0)
++			dump_mode = need_arg(&i, argc, argv);
++		else
++		{
++			fprintf(stderr, "unknown argument %s\n", argv[i]);
++			usage();
++			return 2;
++		}
++	}
++
++	if (!yuv_path || !vector_name || !dump_dir || !dump_mode || width <= 0 || height <= 0 || budget == 0)
++	{
++		usage();
++		return 2;
++	}
++	if (width % 2 || height % 2)
++	{
++		fprintf(stderr, "YUV420P width and height must be even\n");
++		return 2;
++	}
++
++	int dump_on = strcmp(dump_mode, "on") == 0;
++	if (!dump_on && strcmp(dump_mode, "off") != 0)
++	{
++		fprintf(stderr, "--dump must be on or off\n");
++		return 2;
++	}
++
++	size_t y_bytes = (size_t)width * (size_t)height;
++	size_t c_bytes = y_bytes / 4;
++	size_t total = y_bytes + c_bytes * 2;
++	FILE *fp = fopen(yuv_path, "rb");
++	if (!fp)
++	{
++		fprintf(stderr, "cannot open %s\n", yuv_path);
++		return 1;
++	}
++	unsigned char *frame = (unsigned char *)malloc(total);
++	if (!frame)
++	{
++		fclose(fp);
++		return 1;
++	}
++	size_t got = fread(frame, 1, total, fp);
++	fclose(fp);
++	if (got != total)
++	{
++		fprintf(stderr, "yuv is %zu bytes, expected %zu\n", got, total);
++		free(frame);
++		return 1;
++	}
++
++	pyrowave_device device = NULL;
++	pyrowave_result result = pyrowave_create_default_device(&device);
++	if (result != PYROWAVE_SUCCESS)
++	{
++		fprintf(stderr, "pyrowave_create_default_device failed (%d)\n", (int)result);
++		free(frame);
++		return 1;
++	}
++
++	pyrowave_encoder_create_info info = {};
++	info.device = device;
++	info.width = width;
++	info.height = height;
++	info.chroma = PYROWAVE_CHROMA_SUBSAMPLING_420;
++
++	pyrowave_encoder encoder = NULL;
++	result = pyrowave_encoder_create(&info, &encoder);
++	if (result != PYROWAVE_SUCCESS)
++	{
++		fprintf(stderr, "pyrowave_encoder_create failed (%d)\n", (int)result);
++		pyrowave_device_destroy(device);
++		free(frame);
++		return 1;
++	}
++
++	if (dump_on)
++		pyrowave_encoder_set_dump_dir(encoder, dump_dir, vector_name);
++	else
++		pyrowave_encoder_set_dump_dir(encoder, "", vector_name);
++
++	pyrowave_cpu_buffer cpu = {};
++	cpu.data[0] = frame;
++	cpu.data[1] = frame + y_bytes;
++	cpu.data[2] = frame + y_bytes + c_bytes;
++	cpu.row_stride_in_bytes[0] = (size_t)width;
++	cpu.row_stride_in_bytes[1] = (size_t)width / 2;
++	cpu.row_stride_in_bytes[2] = (size_t)width / 2;
++	cpu.plane_size_in_bytes[0] = y_bytes;
++	cpu.plane_size_in_bytes[1] = c_bytes;
++	cpu.plane_size_in_bytes[2] = c_bytes;
++	cpu.width = width;
++	cpu.height = height;
++	cpu.format = PYROWAVE_CPU_BUFFER_FORMAT_YUV420P;
++
++	pyrowave_rate_control rate = {};
++	rate.maximum_bitstream_size = (size_t)budget;
++
++	result = pyrowave_encoder_encode_cpu(encoder, &cpu, &rate);
++	fprintf(stdout, "encode_cpu %d vector %s %dx%d budget %llu dump %s\n",
++	        (int)result, vector_name, width, height, budget, dump_on ? "on" : "off");
++
++	pyrowave_encoder_destroy(encoder);
++	pyrowave_device_destroy(device);
++	free(frame);
++	return result == PYROWAVE_SUCCESS ? 0 : 1;
++}

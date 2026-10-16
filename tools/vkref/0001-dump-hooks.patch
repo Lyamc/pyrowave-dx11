@@ -1,143 +1,812 @@
-diff --git a/pyrowave_encoder.hpp b/pyrowave_encoder.hpp
-index 355f82c..f65605a 100644
---- a/pyrowave_encoder.hpp
-+++ b/pyrowave_encoder.hpp
-@@ -40,6 +40,8 @@ public:
- 	// Debug hackery
- 	const Vulkan::ImageView &get_wavelet_band(int component, int level);
- 	bool encode_pre_transformed(Vulkan::CommandBuffer &cmd, const BitstreamBuffers &buffers, float quant_scale);
-+	// Dump hooks for vkref validation (T6a).
-+	void dump_hook(int stage, const char *name);
- 	//
+diff --git a/pyrowave.h b/pyrowave.h
+index 09ed723..c085ea5 100644
+--- a/pyrowave.h
++++ b/pyrowave.h
+@@ -560,6 +560,12 @@ PYROWAVE_PUBLIC_API pyrowave_result
+ pyrowave_encoder_encode_cpu(pyrowave_encoder encoder, const pyrowave_cpu_buffer *buffers,
+                             const pyrowave_rate_control *rate_control);
  
- 	uint64_t get_meta_required_size() const;
-
++// VALIDATION §3.2. NULL or an empty directory disables dumping (no extra copies, no files).
++// vector_name is written into manifest.json. The device string is queried from the physical device.
++// When dumping is enabled, encode waits for the GPU and writes the dump before returning.
++PYROWAVE_PUBLIC_API void
++pyrowave_encoder_set_dump_dir(pyrowave_encoder encoder, const char *directory, const char *vector_name);
++
+ // Can only be called after a successful encoding operation and result is only valid for that particular frame.
+ // Computes the number of network packets required if each packet can consume a provided number of bytes.
+ PYROWAVE_PUBLIC_API pyrowave_result
+diff --git a/pyrowave_c.cpp b/pyrowave_c.cpp
+index 5489596..005d41f 100644
+--- a/pyrowave_c.cpp
++++ b/pyrowave_c.cpp
+@@ -12,6 +12,7 @@
+ #include "slangmosh_scaler.hpp"
+ #include "scaler.hpp"
+ #include "thread_id.hpp"
++#include <cstdio>
+ 
+ using namespace Granite;
+ using namespace Vulkan;
+@@ -1017,12 +1018,15 @@ static void pyrowave_device_signal_semaphore(Device *device, CommandBuffer::Type
+ 	}
+ }
+ 
++} // extern "C". The record helper is a template, so it cannot have C language linkage.
++
++template <typename RecordFn>
+ static pyrowave_result
+-pyrowave_encoder_encode_gpu_inner(pyrowave_encoder encoder,
++pyrowave_encoder_record_and_submit(pyrowave_encoder encoder,
+                                   const pyrowave_gpu_sync_operation *acquire,
+                                   const pyrowave_gpu_sync_operation *release,
+-                                  const ViewBuffers &views,
+-                                  const pyrowave_rate_control *rate_control)
++                                  const pyrowave_rate_control *rate_control,
++                                  RecordFn &&record)
+ {
+ 	auto *device = encoder->device;
+ 
+@@ -1055,6 +1059,10 @@ pyrowave_encoder_encode_gpu_inner(pyrowave_encoder encoder,
+ 	if (!context.queued_meta_gpu)
+ 		return PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
+ 
++	// Budget in the manifest is the caller's size, before the 4-byte mask (VALIDATION §3.4).
++	if (encoder->encoder.dump_enabled())
++		encoder->encoder.set_dump_budget(rate_control->maximum_bitstream_size);
++
+ 	auto target_bitstream_size = rate_control->maximum_bitstream_size & ~VkDeviceSize(3u);
+ 
+ 	// Check for bogus sizes.
+@@ -1101,10 +1109,11 @@ pyrowave_encoder_encode_gpu_inner(pyrowave_encoder encoder,
+ 		}
+ 	}
+ 
+-	auto ret = encoder->encoder.encode(*cmd, views, bitstream_buffers);
++	auto ret = record(*cmd, bitstream_buffers);
+ 	if (!ret)
+ 	{
+ 		device->submit_discard(cmd);
++		encoder->encoder.abandon_dump();
+ 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+ 	}
+ 
+@@ -1152,9 +1161,34 @@ pyrowave_encoder_encode_gpu_inner(pyrowave_encoder encoder,
+ 
+ 	pyrowave_device_signal_semaphore(device, encoder->pyro_device->queue_type, release);
+ 
++	// Dump copies were recorded inside encode(). Read them only after the fence.
++	// No fence means the caller owns the command buffer; finish_dump runs from the map path.
++	if (encoder->encoder.dump_enabled() && context.queued_fence)
++	{
++		context.queued_fence->wait();
++		if (!encoder->encoder.finish_dump())
++			return PYROWAVE_ERROR_GENERIC;
++	}
++
+ 	return PYROWAVE_SUCCESS;
+ }
+ 
++static pyrowave_result
++pyrowave_encoder_encode_gpu_inner(pyrowave_encoder encoder,
++                                  const pyrowave_gpu_sync_operation *acquire,
++                                  const pyrowave_gpu_sync_operation *release,
++                                  const ViewBuffers &views,
++                                  const pyrowave_rate_control *rate_control)
++{
++	return pyrowave_encoder_record_and_submit(
++			encoder, acquire, release, rate_control,
++			[&](CommandBuffer &cmd, const Encoder::BitstreamBuffers &buffers) {
++				return encoder->encoder.encode(cmd, views, buffers);
++			});
++}
++
++extern "C" {
++
+ pyrowave_result
+ pyrowave_encoder_encode_gpu(pyrowave_encoder encoder,
+                             const pyrowave_gpu_sync_operation *acquire,
+@@ -1546,6 +1580,35 @@ pyrowave_encoder_encode_cpu(pyrowave_encoder encoder, const pyrowave_cpu_buffer
+ 	return ret;
+ }
+ 
++void pyrowave_encoder_set_dump_dir(pyrowave_encoder encoder, const char *directory, const char *vector_name)
++{
++	if (!encoder)
++		return;
++	if (!directory || !directory[0])
++	{
++		encoder->encoder.set_dump_dir(nullptr, nullptr, nullptr);
++		return;
++	}
++
++	const VkPhysicalDeviceProperties &props = encoder->device->get_gpu_properties();
++	char device_name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE + 64];
++	if (props.vendorID == 0x10DEu)
++	{
++		uint32_t driver = props.driverVersion;
++		snprintf(device_name, sizeof(device_name), "%s/%u.%u.%u.%u",
++		         props.deviceName,
++		         (driver >> 22) & 0x3ffu,
++		         (driver >> 14) & 0xffu,
++		         (driver >> 6) & 0xffu,
++		         driver & 0x3fu);
++	}
++	else
++	{
++		snprintf(device_name, sizeof(device_name), "%s/%u", props.deviceName, props.driverVersion);
++	}
++	encoder->encoder.set_dump_dir(directory, vector_name ? vector_name : "", device_name);
++}
++
+ pyrowave_result
+ pyrowave_encoder_compute_num_packets_with_padding(
+ 		pyrowave_encoder encoder, size_t packet_boundary, size_t padding_size, size_t *num_packets)
+@@ -1632,6 +1695,9 @@ pyrowave_encoder_get_mapped_raw_bitstream(
+ 	if (context.queued_fence)
+ 		context.queued_fence->wait();
+ 
++	if (encoder->encoder.dump_enabled())
++		encoder->encoder.finish_dump();
++
+ 	if (!context.queued_meta || !context.queued_bitstream)
+ 		return PYROWAVE_ERROR_GENERIC;
+ 
 diff --git a/pyrowave_encoder.cpp b/pyrowave_encoder.cpp
-index 571ec72..1c947d9 100644
+index 571ec72..73efe6d 100644
 --- a/pyrowave_encoder.cpp
 +++ b/pyrowave_encoder.cpp
-@@ -77,7 +77,7 @@ struct Encoder::Impl final : public WaveletBuffers
- 	bool encode(CommandBuffer &cmd, const ViewBuffers &views, const BitstreamBuffers &buffers);
- 	bool encode_pre_transformed(CommandBuffer &cmd, const BitstreamBuffers &buffers, float quant_scale);
- 	bool encode_quant_and_coding(CommandBuffer &cmd, const BitstreamBuffers &buffers, float quant_scale);
--
-+	bool encode_bands(CommandBuffer &cmd, const BitstreamBuffers &buffers);
- 	bool dwt(CommandBuffer &cmd, const ViewBuffers &views);
- 	bool quant(CommandBuffer &cmd, float quant_scale);
- 	bool analyze_rdo(CommandBuffer &cmd);
-@@ -106,6 +106,10 @@ struct Encoder::Impl final : public WaveletBuffers
+@@ -8,6 +8,13 @@
+ #include "pyrowave_common.hpp"
+ #include <algorithm>
+ #include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <utility>
++#include <vector>
++#include <sys/stat.h>
++#include <sys/types.h>
+ 
+ namespace PyroWave
+ {
+@@ -106,6 +113,41 @@ struct Encoder::Impl final : public WaveletBuffers
  	void compute_block_active_words(int bands, uint32_t *words, size_t word_count, const void *mapped_meta) const;
  
  	uint32_t sequence_count = 0;
 +
-+	// Dump hooks for vkref validation (T6a).
-+	bool dump_enabled = false;
-+	std::string dump_dir;
++	// VALIDATION §3.2. Empty dump_directory means the hooks record nothing.
++	bool dump_bands(CommandBuffer &cmd);
++	bool dump_after_quant(CommandBuffer &cmd);
++	bool dump_bucket(CommandBuffer &cmd);
++	bool dump_quant_buffer(CommandBuffer &cmd);
++	bool dump_packed(CommandBuffer &cmd, const BitstreamBuffers &buffers);
++	bool dump_copy_buffer(CommandBuffer &cmd, int stage, const char *name, const Buffer &src,
++	                      VkDeviceSize offset, VkDeviceSize byte_count);
++	void barrier_dump_host(CommandBuffer &cmd);
++	void reset_dump_slots();
++
++	void set_dump_dir(const char *directory, const char *vector_name, const char *device_name);
++	void set_dump_budget(uint64_t budget_bytes);
++	bool dump_enabled() const;
++	bool finish_dump();
++	void abandon_dump();
++
++	struct DumpSlot
++	{
++		std::string name;
++		int stage = 0;
++		std::string dtype;
++		int dim0 = 0;
++		int dim1 = -1;
++		BufferHandle host;
++		VkDeviceSize bytes = 0;
++		bool widen_f16 = false;
++	};
++	std::vector<DumpSlot> dump_slots;
++	std::string dump_directory;
++	std::string dump_vector;
++	std::string dump_device;
++	uint64_t dump_budget = 0;
++	bool dump_finished = false;
  };
  
  float Encoder::Impl::get_quant_rdo_distortion_scale(int level, int component, int band) const
-@@ -1165,15 +1169,42 @@ bool Encoder::Impl::encode_quant_and_coding(
- 	if (!quant(cmd, quant_scale))
- 		return false;
+@@ -281,6 +323,8 @@ bool Encoder::Impl::block_packing(CommandBuffer &cmd, const BitstreamBuffers &bu
+ 	device->register_time_interval("GPU", std::move(start_packing), std::move(end_packing), "Packing");
+ 	cmd.end_region();
  
-+	// Dump after quant (stage 2).
-+	if (dump_enabled && !dump_dir.empty())
-+	{
-+		dump_hook(2, meta-buffer, *meta_buffer);
-+		dump_hook(2, block-stat-buffer, *block_stat_buffer);
-+		dump_hook(2, payload-data, *payload_data);
-+	}
-+
- 	if (!analyze_rdo(cmd))
- 		return false;
- 
-+	// Dump after analyze_rdo (stage 3).
-+	if (dump_enabled && !dump_dir.empty())
-+	{
-+		dump_hook(3, bucket-buffer, *bucket_buffer);
-+	}
-+
- 	if (!resolve_rdo(cmd, buffers.target_size))
- 		return false;
- 
-+	// Dump after resolve_rdo (stage 4).
-+	if (dump_enabled && !dump_dir.empty())
-+	{
-+		dump_hook(4, quant-buffer, *quant_buffer);
-+	}
-+
- 	if (!block_packing(cmd, buffers, quant_scale))
- 		return false;
- 
-+	// Dump after block_packing (stage 5).
-+	if (dump_enabled && !dump_dir.empty())
-+	{
-+		dump_hook(5,  meta-buffer, *buffers.meta.buffer);
-+		dump_hook(5, bitstream, *buffers.bitstream.buffer);
-+	}
-+
- 	cmd.enable_subgroup_size_control(false);
++	if (!dump_packed(cmd, buffers))
++		return false;
  	return true;
  }
-@@ -1215,6 +1246,15 @@ bool Encoder::Impl::encode(CommandBuffer &cmd, const ViewBuffers &views, const B
- 	cmd.enable_subgroup_size_control(true);
- 	if (!dwt(cmd, views))
- 		return false;
-+
-+	// Dump after dwt (stage 1).
-+	if (dump_enabled && !dump_dir.empty())
-+	{
-+		for (int c = 0; c < NumComponents; c++)
-+			for (int l = 0; l < DecompositionLevels; l++)
-+				dump_hook(1, component_layer_views[c][l]);
-+	}
-+
- 	cmd.enable_subgroup_size_control(false);
  
- 	// Don't need to read the payload offset counter until quantizer.
-@@ -1278,6 +1318,45 @@ bool Encoder::encode_pre_transformed(Vulkan::CommandBuffer &cmd, const Bitstream
- 	return impl->encode_pre_transformed(cmd, buffers, quant_scale);
+@@ -338,6 +382,8 @@ bool Encoder::Impl::resolve_rdo(CommandBuffer &cmd, size_t target_payload_size)
+ 	auto end_resolve = cmd.write_timestamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+ 	device->register_time_interval("GPU", std::move(start_resolve), std::move(end_resolve), "Resolve");
+ 	cmd.set_specialization_constant_mask(0);
++	if (!dump_quant_buffer(cmd))
++		return false;
+ 	return true;
  }
  
-+bool Encoder::encode_bands(Vulkan::CommandBuffer &cmd, const BitstreamBuffers &buffers)
-+{
-+	return impl->encode_bands(cmd, buffers);
+@@ -413,6 +459,8 @@ bool Encoder::Impl::analyze_rdo(CommandBuffer &cmd)
+ 	cmd.end_region();
+ 	auto end_analyze = cmd.write_timestamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+ 	device->register_time_interval("GPU", std::move(start_analyze), std::move(end_analyze), "Analyze");
++	if (!dump_bucket(cmd))
++		return false;
+ 	return true;
+ }
+ 
+@@ -488,6 +536,8 @@ bool Encoder::Impl::quant(CommandBuffer &cmd, float quant_scale)
+ 
+ 	auto end_quant = cmd.write_timestamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+ 	device->register_time_interval("GPU", std::move(start_quant), std::move(end_quant), "Quant");
++	if (!dump_after_quant(cmd))
++		return false;
+ 	return true;
+ }
+ 
+@@ -598,6 +648,8 @@ bool Encoder::Impl::dwt(CommandBuffer &cmd, const ViewBuffers &views)
+ 	auto end_dwt = cmd.write_timestamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+ 	device->register_time_interval("GPU", std::move(start_dwt), std::move(end_dwt), "DWT");
+ 	cmd.set_specialization_constant_mask(0);
++	if (!dump_bands(cmd))
++		return false;
+ 	return true;
+ }
+ 
+@@ -1181,6 +1233,10 @@ bool Encoder::Impl::encode_quant_and_coding(
+ bool Encoder::Impl::encode_pre_transformed(
+ 		Vulkan::CommandBuffer &cmd, const BitstreamBuffers &buffers, float quant_scale)
+ {
++	// Bands are already resident. A normal encode() dumps them from dwt() instead.
++	if (!dump_bands(cmd))
++		return false;
++
+ 	cmd.fill_buffer(*payload_data, 0, 0, 2 * sizeof(uint32_t));
+ 	cmd.fill_buffer(*bucket_buffer, 0);
+ 	cmd.fill_buffer(*quant_buffer, 0);
+@@ -1190,12 +1246,17 @@ bool Encoder::Impl::encode_pre_transformed(
+ 	            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+ 	            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+ 
+-	return encode_quant_and_coding(cmd, buffers, quant_scale);
++	if (!encode_quant_and_coding(cmd, buffers, quant_scale))
++		return false;
++	barrier_dump_host(cmd);
++	return true;
+ }
+ 
+ bool Encoder::Impl::encode(CommandBuffer &cmd, const ViewBuffers &views, const BitstreamBuffers &buffers)
+ {
+ 	sequence_count = (sequence_count + 1) & SequenceCountMask;
++	if (!dump_directory.empty())
++		reset_dump_slots();
+ 
+ 	cmd.image_barrier(*wavelet_img_high_res, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+ 	                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+@@ -1222,9 +1283,503 @@ bool Encoder::Impl::encode(CommandBuffer &cmd, const ViewBuffers &views, const B
+ 	            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+ 	            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+ 
+-	return encode_quant_and_coding(cmd, buffers, -1.0f);
++	if (!encode_quant_and_coding(cmd, buffers, -1.0f))
++		return false;
++	barrier_dump_host(cmd);
++	return true;
 +}
 +
-+void Encoder::Impl::dump_hook(int stage, const char *name, const BufferHandle &buf)
++namespace
 +{
-+	if (!dump_enabled || dump_dir.empty())
-+		return;
++uint32_t sha_rotr(uint32_t x, uint32_t r)
++{
++	return (x >> r) | (x << (32u - r));
++}
 +
-+	// Barrier to ensure writes are visible before copying.
-+	device->barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-+	                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
++void sha256(const void *data, size_t len, uint8_t out[32])
++{
++	static const uint32_t K[64] = {
++		0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
++		0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u, 0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
++		0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu, 0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
++		0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u, 0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
++		0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u, 0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
++		0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u, 0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
++		0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u, 0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
++		0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u, 0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u
++	};
 +
-+	// Copy buffer contents to host and write to file.
-+	auto *data = device->map_host_buffer(buf, MEMORY_ACCESS_READ_BIT);
-+	if (!data)
-+		return;
++	uint32_t s[8] = {
++		0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
++		0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
++	};
++	uint8_t block[64];
++	size_t filled = 0;
++	uint64_t msg_bits = uint64_t(len) * 8u;
 +
-+	std::string path = dump_dir + "/" + name + ".bin";
-+	FILE *f = fopen(path.c_str(), "wb");
-+	if (f)
++	auto compress = [&](const uint8_t *p) {
++		uint32_t w[64];
++		for (int i = 0; i < 16; i++)
++		{
++			w[i] = (uint32_t(p[i * 4]) << 24) | (uint32_t(p[i * 4 + 1]) << 16) |
++			       (uint32_t(p[i * 4 + 2]) << 8) | uint32_t(p[i * 4 + 3]);
++		}
++		for (int i = 16; i < 64; i++)
++		{
++			uint32_t s0 = sha_rotr(w[i - 15], 7) ^ sha_rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
++			uint32_t s1 = sha_rotr(w[i - 2], 17) ^ sha_rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
++			w[i] = w[i - 16] + s0 + w[i - 7] + s1;
++		}
++		uint32_t a = s[0], b = s[1], c = s[2], d = s[3], e = s[4], f = s[5], g = s[6], h = s[7];
++		for (int i = 0; i < 64; i++)
++		{
++			uint32_t S1 = sha_rotr(e, 6) ^ sha_rotr(e, 11) ^ sha_rotr(e, 25);
++			uint32_t ch = (e & f) ^ ((~e) & g);
++			uint32_t t1 = h + S1 + ch + K[i] + w[i];
++			uint32_t S0 = sha_rotr(a, 2) ^ sha_rotr(a, 13) ^ sha_rotr(a, 22);
++			uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
++			uint32_t t2 = S0 + maj;
++			h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
++		}
++		s[0] += a; s[1] += b; s[2] += c; s[3] += d; s[4] += e; s[5] += f; s[6] += g; s[7] += h;
++	};
++
++	auto append = [&](const uint8_t *p, size_t n) {
++		while (n)
++		{
++			size_t take = 64 - filled;
++			if (take > n)
++				take = n;
++			memcpy(block + filled, p, take);
++			filled += take;
++			p += take;
++			n -= take;
++			if (filled == 64)
++			{
++				compress(block);
++				filled = 0;
++			}
++		}
++	};
++
++	append(static_cast<const uint8_t *>(data), len);
++	uint8_t one = 0x80;
++	append(&one, 1);
++	uint8_t zero = 0;
++	while (filled != 56)
++		append(&zero, 1);
++	uint8_t lenb[8];
++	for (int i = 0; i < 8; i++)
++		lenb[i] = uint8_t(msg_bits >> (56 - 8 * i));
++	append(lenb, 8);
++
++	for (int i = 0; i < 8; i++)
 +	{
-+		fwrite(data, 1, buf->get_create_info().size, f);
-+		fclose(f);
++		out[i * 4] = uint8_t(s[i] >> 24);
++		out[i * 4 + 1] = uint8_t(s[i] >> 16);
++		out[i * 4 + 2] = uint8_t(s[i] >> 8);
++		out[i * 4 + 3] = uint8_t(s[i]);
 +	}
 +}
 +
-+void Encoder::Impl::dump_hook(int stage, const ImageViewHandle &view)
++void sha256_hex(const void *data, size_t len, char out[65])
 +{
-+	// Image dumping is handled at the driver level.
-+	// This stub exists so the encoder compiles; the driver
-+	// overrides dump_hook for ImageViewHandle to do proper
-+	// image->buffer copy + readback.
-+	(void)stage;
-+	(void)view;
++	uint8_t raw[32];
++	sha256(data, len, raw);
++	for (int i = 0; i < 32; i++)
++		snprintf(out + i * 2, 3, "%02x", raw[i]);
++}
++
++float half_to_float(uint16_t h)
++{
++	uint32_t sign = uint32_t(h & 0x8000u) << 16;
++	uint32_t exp = (h >> 10) & 0x1fu;
++	uint32_t mant = h & 0x3ffu;
++	uint32_t bits;
++	if (exp == 0)
++	{
++		if (mant == 0)
++		{
++			bits = sign;
++		}
++		else
++		{
++			exp = 1;
++			while ((mant & 0x400u) == 0)
++			{
++				mant <<= 1;
++				exp--;
++			}
++			mant &= 0x3ffu;
++			bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
++		}
++	}
++	else if (exp == 31)
++	{
++		bits = sign | 0x7f800000u | (mant << 13);
++	}
++	else
++	{
++		bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
++	}
++	float f;
++	memcpy(&f, &bits, sizeof(f));
++	return f;
++}
++
++void json_escape(FILE *fp, const std::string &text)
++{
++	for (char ch : text)
++	{
++		unsigned char c = static_cast<unsigned char>(ch);
++		if (c == '\\' || c == '"')
++		{
++			fputc('\\', fp);
++			fputc(c, fp);
++		}
++		else if (c < 0x20)
++		{
++			fprintf(fp, "\\u%04x", c);
++		}
++		else
++		{
++			fputc(c, fp);
++		}
++	}
++}
++
++void mkdir_p(const std::string &path)
++{
++	std::string cur;
++	for (size_t i = 0; i < path.size(); i++)
++	{
++		cur.push_back(path[i]);
++		if (path[i] == '/' || path[i] == '\\' || i + 1 == path.size())
++		{
++			std::string dir = cur;
++			while (!dir.empty() && (dir.back() == '/' || dir.back() == '\\'))
++				dir.pop_back();
++			if (dir.empty() || dir == "." || (dir.size() == 2 && dir[1] == ':'))
++				continue;
++			if (::mkdir(dir.c_str(), 0755) != 0)
++				continue;
++		}
++	}
++}
++
++int shape_len(VkDeviceSize bytes)
++{
++	return bytes > VkDeviceSize(0x7fffffff) ? 0x7fffffff : int(bytes);
++}
++}
++
++void Encoder::Impl::reset_dump_slots()
++{
++	dump_slots.clear();
++	dump_finished = false;
++}
++
++void Encoder::Impl::set_dump_dir(const char *directory, const char *vector_name, const char *device_name)
++{
++	if (!directory || !directory[0])
++	{
++		dump_directory.clear();
++		dump_vector.clear();
++		dump_device.clear();
++		abandon_dump();
++		return;
++	}
++	dump_directory = directory;
++	dump_vector = vector_name ? vector_name : "";
++	dump_device = device_name ? device_name : "";
++}
++
++void Encoder::Impl::set_dump_budget(uint64_t budget_bytes)
++{
++	dump_budget = budget_bytes;
++}
++
++bool Encoder::Impl::dump_enabled() const
++{
++	return !dump_directory.empty();
++}
++
++void Encoder::Impl::abandon_dump()
++{
++	dump_slots.clear();
++	dump_finished = false;
++}
++
++void Encoder::Impl::barrier_dump_host(CommandBuffer &cmd)
++{
++	if (dump_slots.empty())
++		return;
++	cmd.barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++	            VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
++}
++
++bool Encoder::Impl::dump_copy_buffer(CommandBuffer &cmd, int stage, const char *name, const Buffer &src,
++                                     VkDeviceSize offset, VkDeviceSize byte_count)
++{
++	if (dump_directory.empty() || byte_count == 0)
++		return true;
++
++	BufferCreateInfo info = {};
++	info.domain = BufferDomain::CachedHost;
++	info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++	info.size = byte_count;
++	BufferHandle host = device->create_buffer(info);
++	if (!host)
++		return false;
++	cmd.copy_buffer(*host, 0, src, offset, byte_count);
++
++	DumpSlot slot;
++	slot.name = name;
++	slot.stage = stage;
++	slot.dtype = "u8";
++	slot.dim0 = shape_len(byte_count);
++	slot.dim1 = -1;
++	slot.host = std::move(host);
++	slot.bytes = byte_count;
++	slot.widen_f16 = false;
++	dump_slots.push_back(std::move(slot));
++	return true;
++}
++
++bool Encoder::Impl::dump_bands(CommandBuffer &cmd)
++{
++	if (dump_directory.empty())
++		return true;
++
++	// VALIDATION §3.2: one full barrier, then a host copy of every band layer.
++	cmd.full_barrier();
++	for (int component = 0; component < NumComponents; component++)
++	{
++		for (int level = 0; level < DecompositionLevels; level++)
++		{
++			const ImageView &view = *component_layer_views[component][level];
++			unsigned band_w = view.get_view_width();
++			unsigned band_h = view.get_view_height();
++			bool f16 = view.get_format() == VK_FORMAT_R16_SFLOAT;
++			VkDeviceSize texel = f16 ? 2 : 4;
++			for (int band = 0; band < NumFrequencyBandsPerLevel; band++)
++			{
++				char name[64];
++				snprintf(name, sizeof(name), "band_c%d_l%d_b%d", component, level, band);
++
++				BufferCreateInfo info = {};
++				info.domain = BufferDomain::CachedHost;
++				info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++				info.size = texel * band_w * band_h;
++				BufferHandle host = device->create_buffer(info);
++				if (!host)
++					return false;
++
++				VkImageSubresourceLayers sub = {};
++				sub.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++				sub.mipLevel = view.get_create_info().base_level;
++				sub.baseArrayLayer = view.get_create_info().base_layer + unsigned(band);
++				sub.layerCount = 1;
++				VkOffset3D image_offset = { 0, 0, 0 };
++				VkExtent3D image_extent = { band_w, band_h, 1 };
++				cmd.copy_image_to_buffer(*host, view.get_image(), 0, image_offset, image_extent, 0, 0, sub);
++
++				DumpSlot slot;
++				slot.name = name;
++				slot.stage = 1;
++				slot.dtype = "f32";
++				slot.dim0 = int(band_h);
++				slot.dim1 = int(band_w);
++				slot.host = std::move(host);
++				slot.bytes = info.size;
++				slot.widen_f16 = f16;
++				dump_slots.push_back(std::move(slot));
++			}
++		}
++	}
++	return true;
+ }
+ 
++bool Encoder::Impl::dump_after_quant(CommandBuffer &cmd)
++{
++	if (dump_directory.empty())
++		return true;
++	cmd.full_barrier();
++	if (!dump_copy_buffer(cmd, 2, "meta-buffer", *meta_buffer, 0, meta_buffer->get_create_info().size))
++		return false;
++	if (!dump_copy_buffer(cmd, 2, "block-stat-buffer", *block_stat_buffer, 0, block_stat_buffer->get_create_info().size))
++		return false;
++	if (!dump_copy_buffer(cmd, 2, "payload-data", *payload_data, 0, payload_data->get_create_info().size))
++		return false;
++	return true;
++}
++
++bool Encoder::Impl::dump_bucket(CommandBuffer &cmd)
++{
++	if (dump_directory.empty())
++		return true;
++	cmd.full_barrier();
++	return dump_copy_buffer(cmd, 3, "bucket-buffer", *bucket_buffer, 0, bucket_buffer->get_create_info().size);
++}
++
++bool Encoder::Impl::dump_quant_buffer(CommandBuffer &cmd)
++{
++	if (dump_directory.empty())
++		return true;
++	cmd.full_barrier();
++	return dump_copy_buffer(cmd, 4, "quant-buffer", *quant_buffer, 0, quant_buffer->get_create_info().size);
++}
++
++bool Encoder::Impl::dump_packed(CommandBuffer &cmd, const BitstreamBuffers &buffers)
++{
++	if (dump_directory.empty())
++		return true;
++	cmd.full_barrier();
++	// Stage 5 is the packed output, distinct from the stage-2 meta-buffer.
++	if (!dump_copy_buffer(cmd, 5, "packed-meta", *buffers.meta.buffer, buffers.meta.offset, buffers.meta.size))
++		return false;
++	if (!dump_copy_buffer(cmd, 5, "bitstream", *buffers.bitstream.buffer, buffers.bitstream.offset, buffers.bitstream.size))
++		return false;
++	return true;
++}
++
++bool Encoder::Impl::finish_dump()
++{
++	if (dump_directory.empty() || dump_finished)
++		return true;
++	if (dump_slots.empty())
++		return false;
++
++	mkdir_p(dump_directory);
++
++	struct Written
++	{
++		std::string name;
++		int stage;
++		std::string dtype;
++		int dim0;
++		int dim1;
++		char sha[65];
++	};
++	std::vector<Written> written;
++	written.reserve(dump_slots.size());
++
++	for (auto &slot : dump_slots)
++	{
++		void *mapped = device->map_host_buffer(*slot.host, MEMORY_ACCESS_READ_BIT, 0, slot.bytes);
++		if (!mapped)
++			return false;
++
++		std::vector<uint8_t> file_bytes;
++		if (slot.widen_f16)
++		{
++			size_t count = size_t(slot.bytes / 2);
++			file_bytes.resize(count * sizeof(float));
++			auto *src = static_cast<const uint16_t *>(mapped);
++			auto *dst = reinterpret_cast<float *>(file_bytes.data());
++			for (size_t i = 0; i < count; i++)
++				dst[i] = half_to_float(src[i]);
++		}
++		else
++		{
++			file_bytes.resize(size_t(slot.bytes));
++			memcpy(file_bytes.data(), mapped, size_t(slot.bytes));
++		}
++		device->unmap_host_buffer(*slot.host, MEMORY_ACCESS_READ_BIT, 0, slot.bytes);
++
++		std::string path = dump_directory;
++		if (!path.empty() && path.back() != '/' && path.back() != '\\')
++			path.push_back('/');
++		path += slot.name;
++		path += ".bin";
++
++		FILE *fp = fopen(path.c_str(), "wb");
++		if (!fp)
++			return false;
++		size_t wrote = fwrite(file_bytes.data(), 1, file_bytes.size(), fp);
++		fclose(fp);
++		if (wrote != file_bytes.size())
++			return false;
++
++		Written item;
++		item.name = slot.name;
++		item.stage = slot.stage;
++		item.dtype = slot.dtype;
++		item.dim0 = slot.dim0;
++		item.dim1 = slot.dim1;
++		sha256_hex(file_bytes.data(), file_bytes.size(), item.sha);
++		written.push_back(std::move(item));
++	}
++
++	std::string manifest_path = dump_directory;
++	if (!manifest_path.empty() && manifest_path.back() != '/' && manifest_path.back() != '\\')
++		manifest_path.push_back('/');
++	manifest_path += "manifest.json";
++
++	FILE *mf = fopen(manifest_path.c_str(), "wb");
++	if (!mf)
++		return false;
++	fprintf(mf, "{\n");
++	fprintf(mf, "  \"vector\": \"");
++	json_escape(mf, dump_vector);
++	fprintf(mf, "\",\n");
++	fprintf(mf, "  \"W\": %d,\n", width);
++	fprintf(mf, "  \"H\": %d,\n", height);
++	fprintf(mf, "  \"budget\": %llu,\n", static_cast<unsigned long long>(dump_budget));
++	fprintf(mf, "  \"sequence\": %u,\n", sequence_count);
++	fprintf(mf, "  \"device\": \"");
++	json_escape(mf, dump_device);
++	fprintf(mf, "\",\n");
++	fprintf(mf, "  \"ref\": \"a0d2e71+vkref\",\n");
++	fprintf(mf, "  \"buffers\": [\n");
++	for (size_t i = 0; i < written.size(); i++)
++	{
++		const Written &item = written[i];
++		fprintf(mf, "    {\"name\": \"%s\", \"stage\": %d, \"dtype\": \"%s\", \"shape\": [",
++		        item.name.c_str(), item.stage, item.dtype.c_str());
++		if (item.dim1 < 0)
++			fprintf(mf, "%d", item.dim0);
++		else
++			fprintf(mf, "%d, %d", item.dim0, item.dim1);
++		fprintf(mf, "], \"file\": \"%s.bin\", \"sha256\": \"%s\"}",
++		        item.name.c_str(), item.sha);
++		if (i + 1 != written.size())
++			fputc(',', mf);
++		fputc('\n', mf);
++	}
++	fprintf(mf, "  ]\n}\n");
++	fclose(mf);
++
++	dump_finished = true;
++	return true;
++}
++
++void Encoder::set_dump_dir(const char *directory, const char *vector_name, const char *device_name)
++{
++	impl->set_dump_dir(directory, vector_name, device_name);
++}
++
++void Encoder::set_dump_budget(uint64_t budget_bytes)
++{
++	impl->set_dump_budget(budget_bytes);
++}
++
++bool Encoder::dump_enabled() const
++{
++	return impl->dump_enabled();
++}
++
++bool Encoder::finish_dump()
++{
++	return impl->finish_dump();
++}
++
++void Encoder::abandon_dump()
++{
++	impl->abandon_dump();
 +}
 +
 +
- size_t Encoder::compute_num_packets(const void *meta, size_t packet_boundary, size_t padding_size) const
+ Encoder::Encoder()
  {
- 	return impl->compute_num_packets(meta, packet_boundary, padding_size);
+ 	impl.reset(new Impl);
+diff --git a/pyrowave_encoder.hpp b/pyrowave_encoder.hpp
+index 355f82c..f53d7c7 100644
+--- a/pyrowave_encoder.hpp
++++ b/pyrowave_encoder.hpp
+@@ -42,6 +42,14 @@ public:
+ 	bool encode_pre_transformed(Vulkan::CommandBuffer &cmd, const BitstreamBuffers &buffers, float quant_scale);
+ 	//
+ 
++	// VALIDATION §3.2 / §3.4. A null or empty directory disables dumping and adds no GPU work.
++	void set_dump_dir(const char *directory, const char *vector_name, const char *device_name);
++	void set_dump_budget(uint64_t budget_bytes);
++	bool dump_enabled() const;
++	// Host copies recorded during encode are written after the submit fence has signaled.
++	bool finish_dump();
++	void abandon_dump();
++
+ 	uint64_t get_meta_required_size() const;
+ 
+ 	struct Packet
