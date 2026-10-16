@@ -32,7 +32,7 @@ if not exist "%TEMP_DIR%\vectors\flat0_16x16\manifest.json" set GEN_OK=0
 if not exist "%TEMP_DIR%\vectors\flat0_16x16\frame_0000\frame_0000.yuv" set GEN_OK=0
 
 if not %GEN_OK% equ 1 (
-    echo FAIL GENVECTORS (missing output files)
+    echo FAIL GENVECTORS -- missing output files
     set ALL_PASS=0
 ) else (
     echo PASS GENVECTORS
@@ -73,7 +73,7 @@ if not exist "%TEMP_DIR%\dir_b\manifest.json" goto :dump_fail
 goto :dump_ok
 
 :dump_fail
-echo FAIL PWCOMPARE_SETUP (no manifest)
+echo FAIL PWCOMPARE_SETUP -- no manifest
 set ALL_PASS=0
 goto :end
 
@@ -99,7 +99,7 @@ echo accept_T6d: testing pwcompare.py (different dirs)...
 %PYTHON% "%BASE_DIR%\tools\pwcompare.py" "%TEMP_DIR%\dir_c" "%TEMP_DIR%\dir_d" >"%TEMP_DIR%\cmp_diff.txt" 2>&1
 findstr /C:"VERDICT:" "%TEMP_DIR%\cmp_diff.txt" >nul
 if %errorlevel% neq 0 (
-    echo FAIL PWCOMPARE_DIFFERENT (no verdict)
+    echo FAIL PWCOMPARE_DIFFERENT -- no verdict
     type "%TEMP_DIR%\cmp_diff.txt"
     set ALL_PASS=0
 ) else (
@@ -111,7 +111,7 @@ if %errorlevel% neq 0 (
         if %errorlevel% equ 0 (
             echo PASS PWCOMPARE_DIFFERENT
         ) else (
-            echo FAIL PWCOMPARE_DIFFERENT (unexpected verdict)
+            echo FAIL PWCOMPARE_DIFFERENT -- unexpected verdict
             type "%TEMP_DIR%\cmp_diff.txt"
             set ALL_PASS=0
         )
