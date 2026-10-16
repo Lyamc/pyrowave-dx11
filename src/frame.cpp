@@ -14,7 +14,9 @@
 
 #include "pyrowave_d3d11.h"
 #include "stage_funcs.h"
+#include "stage_internal.h"
 #include "shaders/pack_dxbc.h"
+#include "debug_dump.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -61,6 +63,37 @@ static void compute_frame_params(int W, int H, int /*chroma*/,
 
     *out_total_blocks = total_blocks;
     *out_per_sub = per_sub;
+}
+
+// ------------------------------------------------------------------
+// Helper: read a D3D11 buffer to host memory (for debug dumps)
+// ------------------------------------------------------------------
+static std::vector<uint8_t> readback_buffer(ID3D11Device *dev, ID3D11DeviceContext *ctx,
+                                            ID3D11Buffer *buf, size_t size)
+{
+    if (!buf || size == 0) return {};
+
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = UINT(size);
+    bd.Usage = D3D11_USAGE_STAGING;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    bd.BindFlags = 0;
+
+    ComPtr<ID3D11Buffer> staging;
+    HRESULT hr = dev->CreateBuffer(&bd, nullptr, &staging);
+    if (FAILED(hr)) return {};
+
+    ctx->CopyResource(staging.Get(), buf);
+    ctx->Flush();
+
+    D3D11_MAPPED_SUBRESOURCE ms;
+    hr = ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &ms);
+    if (FAILED(hr)) return {};
+
+    std::vector<uint8_t> result(static_cast<uint8_t*>(ms.pData),
+                                static_cast<uint8_t*>(ms.pData) + size);
+    ctx->Unmap(staging.Get(), 0);
+    return result;
 }
 
 // ------------------------------------------------------------------
@@ -202,6 +235,8 @@ pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder enc,
     hr = dwt_run(enc->dwt);
     if (hr != PWD3D11_SUCCESS) return hr;
 
+    // DWT debug dump: skip band textures (requires texture readback, less critical)
+
     // Step 2: Set up quant with band SRVs
     std::vector<ID3D11ShaderResourceView*> band_srvs;
     std::vector<int> band_w, band_h;
@@ -243,6 +278,38 @@ pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder enc,
     hr = quant_run(enc->quant);
     if (hr != PWD3D11_SUCCESS) return hr;
 
+    // Quant debug dump: meta, stats, payload
+    if (enc->dump_dir[0]) {
+        auto ctx_q = enc->context;
+        size_t meta_size = enc->quant->total_blocks * 8;
+        size_t stats_size = enc->quant->total_blocks * 64;
+        size_t payload_size = enc->quant->payload_size;
+
+        auto meta_data = readback_buffer(enc->d3d11_device.Get(), ctx_q.Get(),
+                                         enc->quant->meta_buf.Get(), meta_size);
+        if (!meta_data.empty()) {
+            debug_dump_buffer(enc->dump_dir, "meta_buffer", 2, 0,
+                              enc->quant->total_blocks * 2, 1,
+                              meta_data.data(), meta_data.size());
+        }
+
+        auto stats_data = readback_buffer(enc->d3d11_device.Get(), ctx_q.Get(),
+                                          enc->quant->stats_buf.Get(), stats_size);
+        if (!stats_data.empty()) {
+            debug_dump_buffer(enc->dump_dir, "block_stat_buffer", 2, 0,
+                              enc->quant->total_blocks * 16, 1,
+                              stats_data.data(), stats_data.size());
+        }
+
+        auto payload_data = readback_buffer(enc->d3d11_device.Get(), ctx_q.Get(),
+                                            enc->quant->payload_buf.Get(), payload_size);
+        if (!payload_data.empty()) {
+            debug_dump_buffer(enc->dump_dir, "payload_data", 2, 0,
+                              UINT(payload_size / 4), 1,
+                              payload_data.data(), payload_data.size());
+        }
+    }
+
     // Step 3: Set up analyze with quant stats output
     int total_blocks, per_sub;
     compute_frame_params(enc->width, enc->height, enc->chroma, &total_blocks, &per_sub);
@@ -264,6 +331,19 @@ pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder enc,
     hr = analyze_finalize_run(enc->analyze);
     if (hr != PWD3D11_SUCCESS) return hr;
 
+    // Analyze debug dump: bucket buffer
+    if (enc->dump_dir[0]) {
+        auto ctx_a = enc->context;
+        auto bucket_data = readback_buffer(enc->d3d11_device.Get(), ctx_a.Get(),
+                                           enc->analyze->bucket_buf.Get(),
+                                           enc->analyze->bucket_size);
+        if (!bucket_data.empty()) {
+            debug_dump_buffer(enc->dump_dir, "bucket_buffer", 3, 0,
+                              UINT(enc->analyze->bucket_size / 4), 1,
+                              bucket_data.data(), bucket_data.size());
+        }
+    }
+
     // Step 4: Set up resolve
     D3D11_SHADER_RESOURCE_VIEW_DESC sd_bucket = {};
     sd_bucket.Format = DXGI_FORMAT_R32_UINT;
@@ -280,6 +360,19 @@ pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder enc,
     unsigned int target_payload = (unsigned int)(rc->maximum_bitstream_size);
     hr = resolve_run(enc->resolve, srv_bucket.Get(), enc->analyze->uav_quant.Get(), target_payload);
     if (hr != PWD3D11_SUCCESS) return hr;
+
+    // Resolve debug dump: quant buffer
+    if (enc->dump_dir[0]) {
+        auto ctx_r = enc->context;
+        auto quant_data = readback_buffer(enc->d3d11_device.Get(), ctx_r.Get(),
+                                          enc->analyze->quant_buf.Get(),
+                                          size_t(total_blocks) * 4);
+        if (!quant_data.empty()) {
+            debug_dump_buffer(enc->dump_dir, "quant_buffer", 4, 1,
+                              total_blocks, 1,
+                              quant_data.data(), quant_data.size());
+        }
+    }
 
     // Step 5: Allocate bitstream and meta buffers
     enc->meta_size = total_blocks * 8;
@@ -413,6 +506,22 @@ pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder enc,
                                static_cast<uint8_t*>(ms.pData) + enc->bitstream_size);
 
     ctx->Unmap(staging_buf.Get(), 0);
+
+    // Pack/Packetize debug dump: bitstream and meta
+    if (enc->dump_dir[0]) {
+        debug_dump_buffer(enc->dump_dir, "bitstream", 5, 1,
+                          UINT(enc->bitstream_size / 4), 1,
+                          enc->host_bitstream.data(), enc->bitstream_size);
+
+        auto ctx_p = enc->context;
+        auto meta_data = readback_buffer(enc->d3d11_device.Get(), ctx_p.Get(),
+                                         enc->meta_buf.Get(), enc->meta_size);
+        if (!meta_data.empty()) {
+            debug_dump_buffer(enc->dump_dir, "meta_out", 5, 0,
+                              UINT(enc->meta_size / 4), 1,
+                              meta_data.data(), meta_data.size());
+        }
+    }
 
     // Increment sequence code
     enc->sequence_code = (enc->sequence_code + 1u) & 7u;
