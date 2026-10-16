@@ -30,7 +30,7 @@ function(precompile_shader name src_file)
     add_custom_command(
         OUTPUT "${Hdr}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUT}"
-        COMMAND fxc /nologo /T cs_5_0 /E main /O3 /WX /Ges /Gis
+        COMMAND fxc /nologo /T cs_5_0 /E main /O3 /Ges /Gis
                 /Fh "${Hdr}" /Vn g_${name}_dxbc "${SRC}"
         COMMAND "C:\\Users\\Lyam\\AppData\\Local\\Programs\\Python\\Python313\\python.exe"
                 "${EMBED_SCRIPT}" "${Hdr}" "g_${name}_dxbc"
@@ -44,6 +44,11 @@ endfunction()
 
 precompile_shader(dwt dwt.hlsl)
 precompile_shader(probe probe.hlsl)
+precompile_shader(quant quant.hlsl)
+precompile_shader(analyze analyze.hlsl)
+precompile_shader(analyze_finalize analyze_finalize.hlsl)
+precompile_shader(resolve resolve.hlsl)
+precompile_shader(pack pack.hlsl)
 
 add_custom_target(shaders ALL DEPENDS "${dwt_Hdr}" "${probe_Hdr}")
 
@@ -54,14 +59,22 @@ add_library(pyrowave_d3d11 SHARED
     device.cpp
     c_api.cpp
     debug_dump.cpp
+    quant.cpp
+    analyze.cpp
+    resolve.cpp
     ${dwt_Hdr}
     ${probe_Hdr}
+    ${quant_Hdr}
+    ${analyze_Hdr}
+    ${analyze_finalize_Hdr}
+    ${resolve_Hdr}
+    ${pack_Hdr}
 )
 target_include_directories(pyrowave_d3d11 PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_BINARY_DIR}"
 )
-target_link_libraries(pyrowave_d3d11 PRIVATE d3d11 dxgi crypt32)
+target_link_libraries(pyrowave_d3d11 PRIVATE d3d11 dxgi crypt32 d3dcompiler)
 set_target_properties(pyrowave_d3d11 PROPERTIES
     OUTPUT_NAME "pyrowave_d3d11"
     SUFFIX ".dll"
@@ -75,14 +88,22 @@ add_library(pyrowave_d3d11_static STATIC
     device.cpp
     c_api.cpp
     debug_dump.cpp
+    quant.cpp
+    analyze.cpp
+    resolve.cpp
     ${dwt_Hdr}
     ${probe_Hdr}
+    ${quant_Hdr}
+    ${analyze_Hdr}
+    ${analyze_finalize_Hdr}
+    ${resolve_Hdr}
+    ${pack_Hdr}
 )
 target_include_directories(pyrowave_d3d11_static PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_BINARY_DIR}"
 )
-target_link_libraries(pyrowave_d3d11_static PRIVATE d3d11 dxgi crypt32)
+target_link_libraries(pyrowave_d3d11_static PRIVATE d3d11 dxgi crypt32 d3dcompiler)
 
 # ------------------------------------------------------------------
 # Tests
@@ -106,6 +127,20 @@ target_include_directories(test_t1 PRIVATE
 target_link_libraries(test_t1 PRIVATE d3d11 dxgi d3dcompiler crypt32)
 target_sources(test_t1 PRIVATE device.cpp c_api.cpp debug_dump.cpp)
 set_target_properties(test_t1 PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+# ------------------------------------------------------------------
+# T2b test: quantization
+# ------------------------------------------------------------------
+add_executable(test_t2_quant tests/test_t2_quant.cpp)
+target_include_directories(test_t2_quant PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_BINARY_DIR}"
+)
+target_link_libraries(test_t2_quant PRIVATE d3d11 dxgi d3dcompiler crypt32)
+target_sources(test_t2_quant PRIVATE device.cpp c_api.cpp debug_dump.cpp quant.cpp)
+set_target_properties(test_t2_quant PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
 )
 

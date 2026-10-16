@@ -17,6 +17,10 @@
 
 using Microsoft::WRL::ComPtr;
 
+// Forward declarations (defined in dwt.cpp and quant.cpp)
+struct DWTState;
+struct QuantState;
+
 // Internal encoder state (stub)
 struct pwd3d11_encoder_t {
     pwd3d11_device device;
@@ -24,6 +28,10 @@ struct pwd3d11_encoder_t {
     int height;
     pwd3d11_chroma_subsampling chroma;
     char dump_dir[512];  // debug dump directory (T6c)
+
+    // Stage states (T1+T2b)
+    DWTState *dwt = nullptr;
+    QuantState *quant = nullptr;
 };
 
 pwd3d11_result pwd3d11_encoder_create(const pwd3d11_encoder_create_info *info, pwd3d11_encoder *out)

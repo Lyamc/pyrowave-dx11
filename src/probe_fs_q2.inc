@@ -24,7 +24,8 @@ static const float fs_q2_qs_expected[16] = {
 };
 
 // Hex float form for HLSL embedding
-static const uint32_t fs_q2_qs_bits[16] = {
+// Note: in HLSL context this produces 'uint' array; in C++ it produces 'uint32_t' array
+static const uint fs_q2_qs_bits[16] = {
     0x40800000u, 0x402aaaabu, 0x40000000u, 0x3fcccccdu,
     0x3faaaaabu, 0x3f924925u, 0x3f800000u, 0x3f638e39u,
     0x3f4ccccdu, 0x3f3a2e8cu, 0x3f2aaaabu, 0x3f1d89d9u,

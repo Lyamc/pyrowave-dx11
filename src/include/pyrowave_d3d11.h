@@ -76,6 +76,10 @@ typedef struct pwd3d11_rate_control {
 typedef struct pwd3d11_device_t  *pwd3d11_device;
 typedef struct pwd3d11_encoder_t *pwd3d11_encoder;
 
+/* Internal stage states (opaque to callers) */
+struct DWTState;
+struct QuantState;
+
 typedef struct pwd3d11_encoder_create_info {
     pwd3d11_device device;
     int width;
