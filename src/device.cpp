@@ -177,6 +177,21 @@ pwd3d11_result pwd3d11_device_get_adapter_info(pwd3d11_device dev, pwd3d11_adapt
     return PWD3D11_SUCCESS;
 }
 
+void *pwd3d11_device_get_d3d11_device(pwd3d11_device dev)
+{
+    // Returns a raw pointer. Caller must Release() it when done.
+    if (!dev) return nullptr;
+    dev->device->AddRef();
+    return dev->device.Get();
+}
+
+void *pwd3d11_device_get_d3d11_context(pwd3d11_device dev)
+{
+    if (!dev) return nullptr;
+    dev->context->AddRef();
+    return dev->context.Get();
+}
+
 void pwd3d11_device_destroy(pwd3d11_device dev)
 {
     if (dev) {

@@ -53,6 +53,7 @@ add_custom_target(shaders ALL DEPENDS "${dwt_Hdr}" "${probe_Hdr}")
 add_library(pyrowave_d3d11 SHARED
     device.cpp
     c_api.cpp
+    debug_dump.cpp
     ${dwt_Hdr}
     ${probe_Hdr}
 )
@@ -60,7 +61,7 @@ target_include_directories(pyrowave_d3d11 PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_BINARY_DIR}"
 )
-target_link_libraries(pyrowave_d3d11 PRIVATE d3d11 dxgi)
+target_link_libraries(pyrowave_d3d11 PRIVATE d3d11 dxgi crypt32)
 set_target_properties(pyrowave_d3d11 PROPERTIES
     OUTPUT_NAME "pyrowave_d3d11"
     SUFFIX ".dll"
@@ -73,6 +74,7 @@ set_target_properties(pyrowave_d3d11 PROPERTIES
 add_library(pyrowave_d3d11_static STATIC
     device.cpp
     c_api.cpp
+    debug_dump.cpp
     ${dwt_Hdr}
     ${probe_Hdr}
 )
@@ -80,7 +82,7 @@ target_include_directories(pyrowave_d3d11_static PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_BINARY_DIR}"
 )
-target_link_libraries(pyrowave_d3d11_static PRIVATE d3d11 dxgi)
+target_link_libraries(pyrowave_d3d11_static PRIVATE d3d11 dxgi crypt32)
 
 # ------------------------------------------------------------------
 # Tests
@@ -90,8 +92,8 @@ target_include_directories(test_t0 PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_BINARY_DIR}"
 )
-target_link_libraries(test_t0 PRIVATE d3d11 dxgi d3dcompiler)
-target_sources(test_t0 PRIVATE device.cpp c_api.cpp)
+target_link_libraries(test_t0 PRIVATE d3d11 dxgi d3dcompiler crypt32)
+target_sources(test_t0 PRIVATE device.cpp c_api.cpp debug_dump.cpp)
 set_target_properties(test_t0 PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
 )
@@ -101,8 +103,24 @@ target_include_directories(test_t1 PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_BINARY_DIR}"
 )
-target_link_libraries(test_t1 PRIVATE d3d11 dxgi d3dcompiler)
+target_link_libraries(test_t1 PRIVATE d3d11 dxgi d3dcompiler crypt32)
+target_sources(test_t1 PRIVATE device.cpp c_api.cpp debug_dump.cpp)
 set_target_properties(test_t1 PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+# ------------------------------------------------------------------
+# T6c test: debug dump hooks + pwd3d11_debug_run_stage
+# ------------------------------------------------------------------
+add_executable(test_t6c tests/test_t6c.cpp)
+target_include_directories(test_t6c PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_BINARY_DIR}"
+)
+target_link_libraries(test_t6c PRIVATE d3d11 dxgi d3dcompiler crypt32)
+target_sources(test_t6c PRIVATE device.cpp c_api.cpp debug_dump.cpp)
+set_target_properties(test_t6c PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
 )
 

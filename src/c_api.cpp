@@ -1,5 +1,6 @@
 // c_api.cpp -- C ABI entry points for pyrowave_d3d11.dll
 // Stubs for encoder functions (T5b fills these in).
+// Debug infrastructure for T6c (dump hooks + pwd3d11_debug_run_stage).
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -7,8 +8,12 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include <wrl/client.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include "pyrowave_d3d11.h"
+#include "debug_dump.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -18,6 +23,7 @@ struct pwd3d11_encoder_t {
     int width;
     int height;
     pwd3d11_chroma_subsampling chroma;
+    char dump_dir[512];  // debug dump directory (T6c)
 };
 
 pwd3d11_result pwd3d11_encoder_create(const pwd3d11_encoder_create_info *info, pwd3d11_encoder *out)
@@ -62,4 +68,58 @@ void pwd3d11_encoder_destroy(pwd3d11_encoder enc)
 pwd3d11_result pwd3d11_encoder_get_timings(pwd3d11_encoder, float *, size_t)
 {
     return PWD3D11_ERROR_NOT_IMPLEMENTED;
+}
+
+// ------------------------------------------------------------------
+// Debug API -- T6c: pwd3d11_debug_run_stage + dump dir (VALIDATION §3.4, §5)
+// ------------------------------------------------------------------
+
+void pwd3d11_debug_set_dump_dir(pwd3d11_encoder enc, const char *dump_dir)
+{
+    if (!enc) return;
+    if (!dump_dir) {
+        enc->dump_dir[0] = '\0';
+        return;
+    }
+    strncpy_s(enc->dump_dir, sizeof(enc->dump_dir), dump_dir, _TRUNCATE);
+}
+
+pwd3d11_result pwd3d11_debug_run_stage(pwd3d11_encoder enc, pwd3d11_stage stage,
+                                        const pwd3d11_debug_buffer *input_buffers,
+                                        size_t num_input_buffers,
+                                        pwd3d11_debug_buffer *output_buffers,
+                                        size_t num_output_buffers)
+{
+    if (!enc) return PWD3D11_ERROR_INVALID_ARGUMENT;
+    (void)input_buffers; (void)num_input_buffers;
+    (void)output_buffers; (void)num_output_buffers;
+
+    switch (stage) {
+    case PWD3D11_STAGE_DWT:
+        // DWT is stage 1: takes raw YUV input, produces band textures.
+        // For M3 mode, input_buffers would be the raw YUV plane data.
+        // output_buffers receive the band outputs (read back from GPU).
+        // TODO (T5b+): full implementation with DWTState integration.
+        // For now, stub: if dump_dir is set, record the call.
+        if (enc->dump_dir[0]) {
+            // Write a minimal manifest indicating DWT stage was "run"
+            const char *names[] = {"stub_dwt_output"};
+            int stages[] = {1};
+            int dtypes[] = {0};
+            int sw[] = {0}, sh[] = {0};
+            debug_write_manifest(enc->dump_dir, "stub", enc->width, enc->height, 0,
+                                 "D3D11-debug", names, stages, dtypes, sw, sh, 1);
+        }
+        return PWD3D11_ERROR_NOT_IMPLEMENTED;
+
+    case PWD3D11_STAGE_QUANT:
+    case PWD3D11_STAGE_ANALYZE:
+    case PWD3D11_STAGE_RESOLVE:
+    case PWD3D11_STAGE_PACK:
+    case PWD3D11_STAGE_PACKETIZE:
+        return PWD3D11_ERROR_NOT_IMPLEMENTED;
+
+    default:
+        return PWD3D11_ERROR_INVALID_ARGUMENT;
+    }
 }
