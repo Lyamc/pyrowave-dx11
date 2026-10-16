@@ -39,6 +39,38 @@ struct PackPushConstants {
 };
 static_assert(sizeof(PackPushConstants) == 48, "PackPushConstants must be 48 bytes");
 
+// Same layout as R/pyrowave_common.hpp. MSVC and MinGW both pack these
+// little-endian bitfields into two uint32s, which is what the Vulkan decoder reads.
+struct BitstreamPacket {
+    uint32_t offset_u32;
+    uint32_t num_words;
+};
+struct BitstreamHeader {
+    uint16_t ballot;
+    uint16_t payload_words : 12;
+    uint16_t sequence : 3;
+    uint16_t extended : 1;
+    uint32_t quant_code : 8;
+    uint32_t block_index : 24;
+};
+struct BitstreamSequenceHeader {
+    uint32_t width_minus_1 : 14;
+    uint32_t height_minus_1 : 14;
+    uint32_t sequence : 3;
+    uint32_t extended : 1;
+    uint32_t total_blocks : 24;
+    uint32_t code : 2;
+    uint32_t chroma_resolution : 1;
+    uint32_t color_primaries : 1;
+    uint32_t transfer_function : 1;
+    uint32_t ycbcr_transform : 1;
+    uint32_t ycbcr_range : 1;
+    uint32_t chroma_siting : 1;
+};
+static_assert(sizeof(BitstreamPacket) == 8, "BitstreamPacket");
+static_assert(sizeof(BitstreamHeader) == 8, "BitstreamHeader");
+static_assert(sizeof(BitstreamSequenceHeader) == 8, "BitstreamSequenceHeader");
+
 // ------------------------------------------------------------------
 // Helper: compute num blocks and per_sub for a frame
 // ------------------------------------------------------------------
@@ -473,11 +505,11 @@ pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder enc,
             ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
             ctx->Dispatch(blocks_x * blocks_y * 4, 1, 1);
 
-            // Clear bindings
-            ID3D11ShaderResourceView *nullsrv = nullptr;
-            ID3D11UnorderedAccessView *nulluav = nullptr;
-            ctx->CSSetShaderResources(0, 3, &nullsrv);
-            ctx->CSSetUnorderedAccessViews(0, 3, &nulluav, nullptr);
+            // Clear bindings. NumViews is 3, so the null list has to be 3 long.
+            ID3D11ShaderResourceView *nullsrv[3] = {};
+            ID3D11UnorderedAccessView *nulluav[3] = {};
+            ctx->CSSetShaderResources(0, 3, nullsrv);
+            ctx->CSSetUnorderedAccessViews(0, 3, nulluav, nullptr);
         }
     }
 
@@ -504,8 +536,15 @@ pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder enc,
 
     enc->host_bitstream.assign(static_cast<uint8_t*>(ms.pData),
                                static_cast<uint8_t*>(ms.pData) + enc->bitstream_size);
+    enc->block_count = total_blocks;
 
     ctx->Unmap(staging_buf.Get(), 0);
+
+    enc->host_meta = readback_buffer(enc->d3d11_device.Get(), ctx.Get(),
+                                     enc->meta_buf.Get(), enc->meta_size);
+    if (enc->host_meta.size() < size_t(total_blocks) * sizeof(BitstreamPacket)) {
+        return PWD3D11_ERROR_GENERIC;
+    }
 
     // Pack/Packetize debug dump: bitstream and meta
     if (enc->dump_dir[0]) {
@@ -533,34 +572,107 @@ pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder enc,
 // ------------------------------------------------------------------
 // Compute number of packets
 // ------------------------------------------------------------------
-pwd3d11_result pwd3d11_encoder_compute_num_packets(pwd3d11_encoder enc, size_t /*packet_boundary*/,
+// Walk the block meta the way R/pyrowave_encoder.cpp packetize does.
+// Returns the packet count, or -1 when a block points outside the bitstream.
+static int packetize_blocks(const pwd3d11_encoder_t *enc, size_t packet_boundary,
+                            pwd3d11_packet *packets, uint8_t *output, size_t output_size)
+{
+    if (enc->block_count <= 0) return -1;
+    if (enc->host_meta.size() < size_t(enc->block_count) * sizeof(BitstreamPacket)) return -1;
+    const auto *meta = reinterpret_cast<const BitstreamPacket *>(enc->host_meta.data());
+    const uint8_t *bits = enc->host_bitstream.data();
+    const size_t bits_size = enc->host_bitstream.size();
+
+    auto block_bytes = [&](int i, const uint8_t **src) -> size_t {
+        size_t words = meta[i].num_words;
+        if (!words) return 0;
+        size_t off = size_t(meta[i].offset_u32) * sizeof(uint32_t);
+        size_t nbytes = words * sizeof(uint32_t);
+        if (off > bits_size || nbytes > bits_size - off) return size_t(-1);
+        *src = bits + off;
+        return nbytes;
+    };
+
+    uint32_t sequence = 0;
+    const uint8_t *first = nullptr;
+    size_t first_n = block_bytes(0, &first);
+    if (first_n == size_t(-1)) return -1;
+    if (first_n >= sizeof(BitstreamHeader)) {
+        sequence = reinterpret_cast<const BitstreamHeader *>(first)->sequence;
+    }
+
+    if (output && output_size < sizeof(BitstreamSequenceHeader)) return -1;
+    BitstreamSequenceHeader header = {};
+    header.width_minus_1 = uint32_t(enc->width - 1);
+    header.height_minus_1 = uint32_t(enc->height - 1);
+    header.sequence = sequence;
+    header.extended = 1;
+    header.code = 0; // BITSTREAM_EXTENDED_CODE_START_OF_FRAME
+    size_t nonzero = 0;
+    for (int i = 0; i < enc->block_count; i++) {
+        if (meta[i].num_words) nonzero++;
+    }
+    header.total_blocks = uint32_t(nonzero);
+    header.chroma_resolution = enc->chroma == PWD3D11_CHROMA_SUBSAMPLING_444 ? 1u : 0u;
+
+    size_t num_packets = 0;
+    size_t size_in_packet = 0;
+    size_t packet_offset = 0;
+    size_t output_offset = 0;
+    if (output) memcpy(output, &header, sizeof(header));
+    output_offset += sizeof(header);
+    size_in_packet += sizeof(header);
+
+    for (int i = 0; i < enc->block_count; i++) {
+        const uint8_t *src = nullptr;
+        size_t nbytes = block_bytes(i, &src);
+        if (nbytes == size_t(-1)) return -1;
+        if (!nbytes) continue;
+        if (size_in_packet + nbytes > packet_boundary) {
+            if (packets) packets[num_packets] = { packet_offset, size_in_packet };
+            num_packets++;
+            size_in_packet = 0;
+            packet_offset = output_offset;
+        }
+        if (output) {
+            if (output_offset + nbytes > output_size) return -1;
+            memcpy(output + output_offset, src, nbytes);
+        }
+        output_offset += nbytes;
+        size_in_packet += nbytes;
+    }
+    if (size_in_packet) {
+        if (packets) packets[num_packets] = { packet_offset, size_in_packet };
+        num_packets++;
+    }
+    return int(num_packets);
+}
+
+pwd3d11_result pwd3d11_encoder_compute_num_packets(pwd3d11_encoder enc, size_t packet_boundary,
                                                     size_t *num_packets)
 {
-    if (!enc || !num_packets) return PWD3D11_ERROR_INVALID_ARGUMENT;
-
-    // Parse meta buffer to count packets
-    // For now, return a placeholder
-    *num_packets = 1;
+    if (!enc || !num_packets || packet_boundary < sizeof(BitstreamSequenceHeader)) {
+        return PWD3D11_ERROR_INVALID_ARGUMENT;
+    }
+    int count = packetize_blocks(enc, packet_boundary, nullptr, nullptr, 0);
+    if (count < 0) return PWD3D11_ERROR_GENERIC;
+    *num_packets = size_t(count);
     return PWD3D11_SUCCESS;
 }
 
 // ------------------------------------------------------------------
-// Packetize: parse meta and copy bitstream to output
+// Packetize: meta offsets into the read-back bitstream, one record the
+// Vulkan decoder accepts (R/pyrowave_encoder.cpp Encoder::Impl::packetize).
 // ------------------------------------------------------------------
 pwd3d11_result pwd3d11_encoder_packetize(pwd3d11_encoder enc, pwd3d11_packet *packets,
-                                          size_t /*packet_boundary*/, size_t *num_packets,
-                                          void * /*bitstream*/, size_t size)
+                                          size_t packet_boundary, size_t *num_packets,
+                                          void *bitstream, size_t size)
 {
-    if (!enc || !num_packets) return PWD3D11_ERROR_INVALID_ARGUMENT;
-
-    // Parse meta buffer to create packet structures
-    // For now, return a placeholder
-    *num_packets = 1;
-    if (packets) {
-        packets[0].offset = 0;
-        packets[0].size = size;
-    }
-
+    if (!enc || !num_packets || !bitstream) return PWD3D11_ERROR_INVALID_ARGUMENT;
+    if (packet_boundary < sizeof(BitstreamSequenceHeader)) return PWD3D11_ERROR_INVALID_ARGUMENT;
+    int count = packetize_blocks(enc, packet_boundary, packets, static_cast<uint8_t *>(bitstream), size);
+    if (count < 0) return PWD3D11_ERROR_GENERIC;
+    *num_packets = size_t(count);
     return PWD3D11_SUCCESS;
 }
 

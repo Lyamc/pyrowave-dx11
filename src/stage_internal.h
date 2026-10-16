@@ -138,7 +138,9 @@ struct pwd3d11_encoder_t {
 
     size_t bitstream_size = 0;
     size_t meta_size = 0;
+    int block_count = 0;
     std::vector<uint8_t> host_bitstream;
+    std::vector<uint8_t> host_meta;
     unsigned int sequence_code;
     float timings[10];
     size_t timing_count = 0;

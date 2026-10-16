@@ -97,7 +97,8 @@ pwd3d11_result analyze_create_buffers(AnalyzeState *st)
     D3D11_BUFFER_DESC bd = {};
     bd.ByteWidth = UINT(bucket_size);
     bd.Usage = D3D11_USAGE_DEFAULT;
-    bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    // Resolve binds this buffer as a shader resource.
+    bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
 
     HRESULT hr = st->device->CreateBuffer(&bd, nullptr, &st->bucket_buf);
     if (FAILED(hr)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -115,7 +116,8 @@ pwd3d11_result analyze_create_buffers(AnalyzeState *st)
     D3D11_BUFFER_DESC bd_quant = {};
     bd_quant.ByteWidth = st->total_blocks_32x32 * 4;
     bd_quant.Usage = D3D11_USAGE_DEFAULT;
-    bd_quant.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    // Pack binds this buffer as a shader resource.
+    bd_quant.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
 
     hr = st->device->CreateBuffer(&bd_quant, nullptr, &st->quant_buf);
     if (FAILED(hr)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;

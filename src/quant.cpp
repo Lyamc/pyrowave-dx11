@@ -83,11 +83,12 @@ pwd3d11_result quant_create(QuantState *st, pwd3d11_device dev, int W, int H, in
 {
     if (!st || !dev) return PWD3D11_ERROR_INVALID_ARGUMENT;
 
-    // Get device and context from pwd3d11_device
-    // Cast internal pwd3d11_device_t to get ComPtr<ID3D11Device>
-    // We need to access through the public API
-    // For now, assume st was initialized with device/context from DWTState
-    (void)dev;
+    // Same borrowed-then-AddRef path as dwt_create. Leaving this unset made
+    // quant_create_outputs reject every encode as an invalid argument.
+    st->device = static_cast<ID3D11Device *>(pwd3d11_device_get_d3d11_device(dev));
+    if (!st->device) return PWD3D11_ERROR_INVALID_ARGUMENT;
+    st->device->GetImmediateContext(&st->context);
+    if (!st->context) return PWD3D11_ERROR_INVALID_ARGUMENT;
 
     st->pw[0] = W;
     st->ph[0] = H;
@@ -143,7 +144,8 @@ pwd3d11_result quant_create_outputs(QuantState *st)
         D3D11_BUFFER_DESC bd = {};
         bd.ByteWidth = total_blocks * 8;
         bd.Usage = D3D11_USAGE_DEFAULT;
-        bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        // Analyze and pack create shader-resource views of this buffer.
+        bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
 
         ComPtr<ID3D11Buffer> buf;
         HRESULT hr = st->device->CreateBuffer(&bd, nullptr, &buf);
@@ -165,7 +167,7 @@ pwd3d11_result quant_create_outputs(QuantState *st)
         D3D11_BUFFER_DESC bd = {};
         bd.ByteWidth = total_blocks * 64;
         bd.Usage = D3D11_USAGE_DEFAULT;
-        bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
 
         ComPtr<ID3D11Buffer> buf;
         HRESULT hr = st->device->CreateBuffer(&bd, nullptr, &buf);
@@ -189,7 +191,7 @@ pwd3d11_result quant_create_outputs(QuantState *st)
         D3D11_BUFFER_DESC bd = {};
         bd.ByteWidth = UINT(st->payload_size);
         bd.Usage = D3D11_USAGE_DEFAULT;
-        bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
 
         ComPtr<ID3D11Buffer> buf;
         HRESULT hr = st->device->CreateBuffer(&bd, nullptr, &buf);

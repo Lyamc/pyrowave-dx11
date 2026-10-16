@@ -136,25 +136,34 @@ static_assert(offsetof(pwd3d11_adapter_info, dedicated_video_memory) == 136, "pw
 
 #define PWD3D11_API_VERSION 1
 
+/* MSVC does not export symbols from a DLL unless asked. Tests compile the
+   sources directly, so they leave this empty. The shared library defines
+   PWD3D11_BUILD_DLL. */
+#if defined(PWD3D11_BUILD_DLL)
+#define PWD3D11_API __declspec(dllexport)
+#else
+#define PWD3D11_API
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-uint32_t       pwd3d11_get_api_version(void);
-pwd3d11_result pwd3d11_create_device(const pwd3d11_device_create_info *info, pwd3d11_device *out);
-pwd3d11_result pwd3d11_device_get_adapter_info(pwd3d11_device, pwd3d11_adapter_info *out);
-void          *pwd3d11_device_get_d3d11_device(pwd3d11_device);  // returns ID3D11Device* (T6c debug)
-void          *pwd3d11_device_get_d3d11_context(pwd3d11_device); // returns ID3D11DeviceContext* (T6c debug)
-void           pwd3d11_device_destroy(pwd3d11_device);
+PWD3D11_API uint32_t pwd3d11_get_api_version(void);
+PWD3D11_API pwd3d11_result pwd3d11_create_device(const pwd3d11_device_create_info *info, pwd3d11_device *out);
+PWD3D11_API pwd3d11_result pwd3d11_device_get_adapter_info(pwd3d11_device, pwd3d11_adapter_info *out);
+PWD3D11_API void          *pwd3d11_device_get_d3d11_device(pwd3d11_device);  // returns ID3D11Device* (T6c debug)
+PWD3D11_API void          *pwd3d11_device_get_d3d11_context(pwd3d11_device); // returns ID3D11DeviceContext* (T6c debug)
+PWD3D11_API void           pwd3d11_device_destroy(pwd3d11_device);
 
-pwd3d11_result pwd3d11_encoder_create(const pwd3d11_encoder_create_info *, pwd3d11_encoder *out);
-pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder, const pwd3d11_cpu_buffer *, const pwd3d11_rate_control *);
-pwd3d11_result pwd3d11_encoder_compute_num_packets(pwd3d11_encoder, size_t packet_boundary, size_t *num_packets);
-pwd3d11_result pwd3d11_encoder_packetize(pwd3d11_encoder, pwd3d11_packet *packets, size_t packet_boundary,
+PWD3D11_API pwd3d11_result pwd3d11_encoder_create(const pwd3d11_encoder_create_info *, pwd3d11_encoder *out);
+PWD3D11_API pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder, const pwd3d11_cpu_buffer *, const pwd3d11_rate_control *);
+PWD3D11_API pwd3d11_result pwd3d11_encoder_compute_num_packets(pwd3d11_encoder, size_t packet_boundary, size_t *num_packets);
+PWD3D11_API pwd3d11_result pwd3d11_encoder_packetize(pwd3d11_encoder, pwd3d11_packet *packets, size_t packet_boundary,
                                          size_t *num_packets, void *bitstream, size_t size);
-void           pwd3d11_encoder_destroy(pwd3d11_encoder);
+PWD3D11_API void           pwd3d11_encoder_destroy(pwd3d11_encoder);
 
-pwd3d11_result pwd3d11_encoder_get_timings(pwd3d11_encoder, float *us, size_t count);
+PWD3D11_API pwd3d11_result pwd3d11_encoder_get_timings(pwd3d11_encoder, float *us, size_t count);
 
 /* ------------------------------------------------------------------ */
 /* Debug API -- T6c: dump hooks + pwd3d11_debug_run_stage (VALIDATION §3.4, §5) */
@@ -186,7 +195,7 @@ typedef enum pwd3d11_stage {
 /* input_buffers: array of pwd3d11_debug_buffer, one per band input (for DWT stage) */
 /* output_buffers: array of pwd3d11_debug_buffer to receive output */
 /* num_input_buffers / num_output_buffers: counts */
-pwd3d11_result pwd3d11_debug_run_stage(pwd3d11_encoder enc, pwd3d11_stage stage,
+PWD3D11_API pwd3d11_result pwd3d11_debug_run_stage(pwd3d11_encoder enc, pwd3d11_stage stage,
                                         const pwd3d11_debug_buffer *input_buffers,
                                         size_t num_input_buffers,
                                         pwd3d11_debug_buffer *output_buffers,
@@ -194,7 +203,7 @@ pwd3d11_result pwd3d11_debug_run_stage(pwd3d11_encoder enc, pwd3d11_stage stage,
 
 /* Set the debug dump output directory. When PWD3D11_DEBUG_DUMP is defined,
    running stages will write manifest.json + *.bin files in VALIDATION §3.4 format. */
-void pwd3d11_debug_set_dump_dir(pwd3d11_encoder enc, const char *dump_dir);
+PWD3D11_API void pwd3d11_debug_set_dump_dir(pwd3d11_encoder enc, const char *dump_dir);
 
 #ifdef __cplusplus
 }

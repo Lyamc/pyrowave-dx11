@@ -605,9 +605,10 @@ static bool test_in1(DWTState *st)
 // ------------------------------------------------------------------
 void dwt_destroy(DWTState *st)
 {
+    // Flush only. The caller deletes the state, same as quant/analyze/resolve.
+    // Deleting here double-freed the COM pointers on encoder destroy.
     if (st) {
         if (st->context) st->context->Flush();
-        delete st;
     }
 }
 

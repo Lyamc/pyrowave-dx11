@@ -22,6 +22,7 @@ file(MAKE_DIRECTORY "${SHADER_OUT}")
 # We then add a size constant using a Python post-processor.
 # ------------------------------------------------------------------
 set(EMBED_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/../tools/embed_shader.py")
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 function(precompile_shader name src_file)
     set(SRC "${SHADER_DIR}/${src_file}")
@@ -32,7 +33,7 @@ function(precompile_shader name src_file)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUT}"
         COMMAND fxc /nologo /T cs_5_0 /E main /O3 /Ges /Gis
                 /Fh "${Hdr}" /Vn g_${name}_dxbc "${SRC}"
-        COMMAND "C:\\Users\\Lyam\\AppData\\Local\\Programs\\Python\\Python313\\python.exe"
+        COMMAND "${Python3_EXECUTABLE}"
                 "${EMBED_SCRIPT}" "${Hdr}" "g_${name}_dxbc"
         DEPENDS "${SRC}" "${EMBED_SCRIPT}"
         COMMENT "[fxc] ${src_file} -> ${name}_dxbc.h"
@@ -77,6 +78,7 @@ target_include_directories(pyrowave_d3d11 PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_BINARY_DIR}"
 )
+target_compile_definitions(pyrowave_d3d11 PRIVATE PWD3D11_BUILD_DLL)
 target_link_libraries(pyrowave_d3d11 PRIVATE d3d11 dxgi crypt32 d3dcompiler)
 set_target_properties(pyrowave_d3d11 PROPERTIES
     OUTPUT_NAME "pyrowave_d3d11"
