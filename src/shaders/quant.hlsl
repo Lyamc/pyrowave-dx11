@@ -55,6 +55,16 @@ groupshared int    gs_overflow[1];
 groupshared uint   gs_payload_counter[1]; // groupshared counter for payload bytes
 groupshared uint   gs_pcode[128];
 
+// firstbithigh(0) is -1. On the HD 6670 it is not, so a 4x2 of zeros inside a
+// live 8x8 (the partial block at the bottom of a 512x288 LL) was charged an
+// extra magnitude bit. The decoder then scrambled that row. A full block never
+// asks for the MSB of zero, which is why 720p and a 512x256 frame stayed a ramp.
+int msb_of(uint v)
+{
+    if (v == 0u) return -1;
+    return int(firstbithigh(v));
+}
+
 // Coefficient buffer written by the DWT store. Out-of-range texels are 0,
 // matching Texture2D.Load.
 float band_at(int layer, int x, int y)
@@ -95,7 +105,7 @@ uint compute_q_stats(int thread_idx, int q, int msb_val, int block4x2_max_val, f
         shifted >>= quality_planes;
     }
 
-    encode_cost_early += int(firstbithigh(uint(shifted))) + 1;
+    encode_cost_early += msb_of(uint(shifted)) + 1;
 
     // num_sig: count of |s| * 2^-q >= 1.0 over 8 texels (wq:113-128 simplified)
     int num_sig = 0;
@@ -201,8 +211,19 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
     // ------------------------------------------------------------------
     // P1: m_wave, code, qs, scaled s, ints, msb, active, early(0)
     // ------------------------------------------------------------------
-    // Cluster max across the 8 lanes. Read the originals; xor 1/2/4 stays inside the cluster.
-    float m_wave = max(max(gs_max[gi], gs_max[gi ^ 1u]), max(gs_max[gi ^ 2u], gs_max[gi ^ 4u]));
+    // Cluster max across all 8 lanes. The old xor only read four originals,
+    // so lanes 3 and 7 of a partial 8x8 (the zero 4x2s that do not touch a
+    // live lane) kept m_wave of 0. They reserved no payload, the code word
+    // still claimed the cluster quality planes, and pack read the next 4x2
+    // as this one. That is the scrambled tail of a 512x288 frame.
+    float m_wave = gs_max[0];
+    m_wave = max(m_wave, gs_max[1]);
+    m_wave = max(m_wave, gs_max[2]);
+    m_wave = max(m_wave, gs_max[3]);
+    m_wave = max(m_wave, gs_max[4]);
+    m_wave = max(m_wave, gs_max[5]);
+    m_wave = max(m_wave, gs_max[6]);
+    m_wave = max(m_wave, gs_max[7]);
 
     uint quant_code = 6;
     float quant_scale = 1.0f;
@@ -243,7 +264,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
         u1.Store(int(block_linear * 64u + 4u), 0u);
     }
 
-    int msb = active ? int(firstbithigh(uint(max_abs))) : -1;
+    int msb = active ? msb_of(uint(max_abs)) : -1;
 
     // Compute early(0) for this thread (q=0)
     int early_t = 0;
@@ -266,7 +287,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
         if (msb_q >= 3) {
             encode_cost_early = quality_planes + 1;
         }
-        encode_cost_early += int(firstbithigh(uint(block4x2_max))) + 1;
+        encode_cost_early += msb_of(uint(block4x2_max)) + 1;
         early_t = encode_cost_early;
         qp_t = quality_planes;
         sh_t = block4x2_max;
@@ -340,7 +361,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
                 InterlockedOr(gs_staging[word_idx], sign_bits << bit_shift);
             }
 
-            int plane_code = int(firstbithigh(uint(sh_t))) + 1;
+            int plane_code = msb_of(uint(sh_t)) + 1;
             int plane_iterations = qp_t + plane_code;
 
             for (int q = plane_iterations - 1; q >= 0; q--) {
@@ -367,7 +388,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
     // Each lane publishes its own 2-bit plane code. Lane 0 merges the cluster.
     gs_pcode[gi] = 0u;
     if (active) {
-        int pc = int(firstbithigh(uint(sh_t))) + 1;
+        int pc = msb_of(uint(sh_t)) + 1;
         if (pc < 0) pc = 0;
         gs_pcode[gi] = uint(pc);
     }
@@ -480,7 +501,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
                     }
                     int enc_early = (shifted > 0) ? 1 : 0;
                     if (msb_q >= 3) enc_early = qp_local + 1;
-                    enc_early += int(firstbithigh(uint(shifted))) + 1;
+                    enc_early += msb_of(uint(shifted)) + 1;
 
                     // Recompute thread_sig for this q
                     int t_sig = 0;

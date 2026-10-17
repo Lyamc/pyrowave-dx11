@@ -45,6 +45,10 @@ struct DWTState {
 
     ComPtr<ID3D11Texture2D> planes[3];
     ComPtr<ID3D11ShaderResourceView> plane_srv[3];
+    // Raw R8 copy of each plane. The DWT reads this, not the texture.
+    ComPtr<ID3D11Buffer> plane_raw[3];
+    ComPtr<ID3D11ShaderResourceView> plane_raw_srv[3];
+    int plane_pitch[3] = {};
 
     BandTex bands[3][Levels];
 
