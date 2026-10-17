@@ -6,9 +6,9 @@ The bitstream matches the Vulkan encoder. A player decodes it with `libpyrowave-
 
 ## Release
 
-Tag **v0.1.0** publishes `pyrowave_d3d11.dll` (x64, MSVC, static CRT, shader bytecode embedded). Put that DLL next to the program, in `C:\Program Files\etherquic`, or point `ETHERQUIC_PYROWAVE_D3D11` at it. `ETHERQUIC_PYROWAVE_D3D11=off` disables the encoder.
+Tag **v0.1.1** publishes `pyrowave_d3d11.dll` (x64, MSVC, static CRT, shader bytecode embedded). Put that DLL next to the program, in `C:\Program Files\etherquic`, or point `ETHERQUIC_PYROWAVE_D3D11` at it. `ETHERQUIC_PYROWAVE_D3D11=off` disables the encoder.
 
-The 0.1.0 DLL encoded a 64×64 frame on a machine with a hardware Direct3D 11 device, and `libpyrowave-shared` decoded that record. It has not been timed on the HD 6670. It loads `d3d11.dll`, `dxgi.dll`, and `D3DCOMPILER_47.dll`, which Windows already provides.
+v0.1.1 encodes a 1280×720 frame on the Radeon HD 6670 that `libpyrowave-shared` decodes as a picture. It loads `d3d11.dll`, `dxgi.dll`, and `D3DCOMPILER_47.dll`, which Windows already provides.
 
 ## Build
 
