@@ -78,8 +78,12 @@ struct PushConstants {
     uint32_t groups_x;
     uint32_t slot_stride;
     uint32_t coeff_pitch;
+    uint32_t src_pitch;
+    uint32_t src_float;
+    uint32_t _pad0;
+    uint32_t _pad1;
 };
-static_assert(sizeof(PushConstants) == 48, "PushConstants must be 48 bytes");
+static_assert(sizeof(PushConstants) == 64, "PushConstants must be 64 bytes");
 
 // ------------------------------------------------------------------
 // Helper: create a 1-layer Texture2DArray SRV (layer 0 only)
@@ -384,6 +388,34 @@ pwd3d11_result dwt_upload_planes(DWTState *st, const pwd3d11_cpu_buffer *buf)
 
         hr = st->device->CreateShaderResourceView(st->planes[c].Get(), &sd_desc, &st->plane_srv[c]);
         if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
+
+        st->plane_pitch[c] = st->pw[c];
+        UINT nbytes = UINT(st->plane_pitch[c] * st->ph[c]);
+        nbytes = (nbytes + 3u) & ~3u;
+        std::vector<uint8_t> packed(nbytes, 0);
+        const auto *src = static_cast<const uint8_t *>(buf->data[c]);
+        int stride = int(buf->row_stride_in_bytes[c]);
+        if (stride <= 0) stride = st->pw[c];
+        for (int y = 0; y < st->ph[c]; y++) {
+            memcpy(packed.data() + size_t(y) * size_t(st->plane_pitch[c]),
+                   src + size_t(y) * size_t(stride), size_t(st->pw[c]));
+        }
+        D3D11_BUFFER_DESC rbd = {};
+        rbd.ByteWidth = nbytes;
+        rbd.Usage = D3D11_USAGE_IMMUTABLE;
+        rbd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        rbd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+        D3D11_SUBRESOURCE_DATA rsd = {};
+        rsd.pSysMem = packed.data();
+        hr = st->device->CreateBuffer(&rbd, &rsd, &st->plane_raw[c]);
+        if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
+        D3D11_SHADER_RESOURCE_VIEW_DESC rsv = {};
+        rsv.Format = DXGI_FORMAT_R32_TYPELESS;
+        rsv.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+        rsv.BufferEx.NumElements = nbytes / 4u;
+        rsv.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+        hr = st->device->CreateShaderResourceView(st->plane_raw[c].Get(), &rsv, &st->plane_raw_srv[c]);
+        if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
     }
 
     return PWD3D11_SUCCESS;
@@ -422,7 +454,6 @@ pwd3d11_result dwt_run(DWTState *st)
 
     auto ctx = st->context;
     ID3D11ComputeShader *cs = st->shader.Get();
-    ID3D11SamplerState *smp = st->sampler.Get();
     ID3D11ShaderResourceView *nullsrv = nullptr;
     ID3D11UnorderedAccessView *nulluav[3] = { nullptr, nullptr, nullptr };
 
@@ -453,15 +484,16 @@ pwd3d11_result dwt_run(DWTState *st)
     }
 
     ctx->CSSetShader(cs, nullptr, 0);
-    ctx->CSSetSamplers(0, 1, &smp);
 
     // Build dispatch list: level 0 Y, then for each level 1..4 components 0,1,2
     // Order: 0,Y -> 1,Cb -> 1,Cr -> 1,Y -> 2,Y -> 2,Cb -> 2,Cr -> 3,Y -> 3,Cb -> 3,Cr -> 4,Y -> 4,Cb -> 4,Cr = 13 dispatches
     struct DispatchEntry {
-        ID3D11ShaderResourceView *srv;
+        ID3D11ShaderResourceView *src;
         ID3D11UnorderedAccessView *uav;
         ID3D11UnorderedAccessView *coeff;
         uint32_t coeff_pitch;
+        uint32_t src_pitch;
+        uint32_t src_float;
         int rx, ry, ax, ay;
         uint32_t dc_shift;
         float range_scale;
@@ -471,10 +503,13 @@ pwd3d11_result dwt_run(DWTState *st)
     std::vector<DispatchEntry> disps;
 
     // Helper to add a dispatch
-    auto add_disp = [&](ID3D11ShaderResourceView *srv, const BandTex &band,
-                        int rx, int ry, int ax, int ay, bool dc, float rs) {
+    auto add_disp = [&](ID3D11ShaderResourceView *src, uint32_t src_pitch, uint32_t src_float,
+                        const BandTex &band, int rx, int ry, int ax, int ay, bool dc, float rs) {
         DispatchEntry e;
-        e.srv = srv; e.uav = band.uav.Get();
+        e.src = src;
+        e.src_pitch = src_pitch;
+        e.src_float = src_float;
+        e.uav = band.uav.Get();
         e.coeff = band.coeff_uav.Get();
         e.coeff_pitch = uint32_t(band.pitch);
         e.rx = rx; e.ry = ry; e.ax = ax; e.ay = ay;
@@ -486,7 +521,7 @@ pwd3d11_result dwt_run(DWTState *st)
     };
 
     // L0: Y component (dc_shift=1, range_scale from buffer)
-    add_disp(st->plane_srv[0].Get(), st->bands[0][0],
+    add_disp(st->plane_raw_srv[0].Get(), uint32_t(st->plane_pitch[0]), 0u, st->bands[0][0],
              st->pw[0], st->ph[0], st->aw, st->ah, true, 1.0f);
 
     // L1..4: for each level, components 0, 1, 2
@@ -497,13 +532,13 @@ pwd3d11_result dwt_run(DWTState *st)
 
             if (is_chroma_l1) {
                 // Chroma L1: input is the chroma plane
-                add_disp(st->plane_srv[c].Get(), st->bands[c][l],
+                add_disp(st->plane_raw_srv[c].Get(), uint32_t(st->plane_pitch[c]), 0u, st->bands[c][l],
                          st->pw[c], st->ph[c], st->aw >> 1, st->ah >> 1, true, 1.0f);
             } else {
-                // Use LL band (layer 0) from previous level of same component
-                add_disp(st->bands[c][l - 1].srv_layer0.Get(), st->bands[c][l],
-                         st->bands[c][l - 1].w, st->bands[c][l - 1].h,
-                         st->bands[c][l - 1].w, st->bands[c][l - 1].h, false, 1.0f);
+                // Layer 0 of the previous level, from the coefficient buffer.
+                const BandTex &prev = st->bands[c][l - 1];
+                add_disp(prev.coeff_srv.Get(), uint32_t(prev.pitch), 1u, st->bands[c][l],
+                         prev.w, prev.h, prev.w, prev.h, false, 1.0f);
             }
         }
     }
@@ -525,10 +560,12 @@ pwd3d11_result dwt_run(DWTState *st)
         pc.groups_x = d.gx;
         pc.slot_stride = d.gx * d.gy * tile;
         pc.coeff_pitch = d.coeff_pitch;
+        pc.src_pitch = d.src_pitch;
+        pc.src_float = d.src_float;
 
         ID3D11UnorderedAccessView *uavs[3] = { d.uav, st->scratch_uav.Get(), d.coeff };
         ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
-        ctx->CSSetShaderResources(0, 1, &d.srv);
+        ctx->CSSetShaderResources(0, 1, &d.src);
 
         for (uint32_t phase = 0; phase < 4; ++phase) {
             pc.phase = phase;

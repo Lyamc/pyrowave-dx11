@@ -13,14 +13,21 @@ cbuffer Push : register(b0)
     uint groups_x;
     uint slot_stride;
     uint coeff_pitch;
+    // src_float == 0: tightly packed R8 plane, src_pitch is the byte stride.
+    // src_float != 0: layer 0 of the previous band, src_pitch is the float stride.
+    uint src_pitch;
+    uint src_float;
+    uint _pad0;
+    uint _pad1;
 };
 
-Texture2DArray<float> uTexture : register(t0);
-SamplerState uSampler : register(s0); // MIRROR addressing == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT
+// Texture2D.Load on the HD 6670 returns a bad texel once x or y passes 7 on a
+// narrow band. A 512x288 level-3 band is 32x18, so the rows past y = 7 (the
+// bottom of the picture) were wrong. A 64-wide frame is aligned to 128 and
+// its bands are narrow, so the same load copied the left edge across the canvas.
+ByteAddressBuffer uSrc : register(t0);
 RWTexture2DArray<float> uOutput : register(u0);
 RWBuffer<float> uScratch : register(u1);
-// Same values as uOutput, one float per texel. Quant reads this. Texture2D.Load
-// on the HD 6670 returns a bad texel once x or y passes 7 on a narrow band.
 RWBuffer<float> uCoeff : register(u2);
 
 #define APRON 4
@@ -87,7 +94,16 @@ float load_texel(int x, int y)
 {
     x = map_coord(x, resolution.x, aligned_resolution.x);
     y = map_coord(y, resolution.y, aligned_resolution.y);
-    float v = uTexture.Load(int4(x, y, 0, 0)).x;
+    float v;
+    if (src_float != 0u) {
+        uint idx = uint(y) * src_pitch + uint(x);
+        v = asfloat(uSrc.Load(idx * 4u));
+    } else {
+        uint idx = uint(y) * src_pitch + uint(x);
+        uint word = uSrc.Load(idx & ~3u);
+        uint shift = (idx & 3u) * 8u;
+        v = float((word >> shift) & 255u) * (1.0 / 255.0);
+    }
     v *= range_scale;
     if (dc_shift != 0u) v -= 0.5;
     return v;
