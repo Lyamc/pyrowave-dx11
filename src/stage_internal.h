@@ -22,7 +22,12 @@ struct BandTex {
     ComPtr<ID3D11UnorderedAccessView> uav;
     ComPtr<ID3D11ShaderResourceView> srv;
     ComPtr<ID3D11ShaderResourceView> srv_layer0;
+    // Float copy of the four layers. Quant reads this instead of the texture.
+    ComPtr<ID3D11Buffer> coeff;
+    ComPtr<ID3D11UnorderedAccessView> coeff_uav;
+    ComPtr<ID3D11ShaderResourceView> coeff_srv;
     int w = 0, h = 0;
+    int pitch = 0;
     DXGI_FORMAT fmt;
 };
 
@@ -47,6 +52,11 @@ struct DWTState {
     int aw = 0, ah = 0;
     int width = 0, height = 0;
     int chroma = 0;
+
+    // Per-group DWT tile. Two slots, sized for the luma level-0 grid.
+    ComPtr<ID3D11Buffer> scratch;
+    ComPtr<ID3D11UnorderedAccessView> scratch_uav;
+    uint32_t scratch_floats = 0;
 };
 
 // ------------------------------------------------------------------
@@ -61,7 +71,10 @@ struct QuantState {
     struct BandRef {
         ComPtr<ID3D11ShaderResourceView> srv;
         int w = 0, h = 0;
-        int level = 0, component = 0;
+        int pitch = 0;
+        int level = 0, component = 0, band = 0;
+        int block_offset_8 = 0, block_stride_8 = 0;
+        int block_offset_32 = 0, block_stride_32 = 0;
     };
     std::vector<BandRef> bands;
     int pw[3], ph[3];
@@ -69,6 +82,7 @@ struct QuantState {
     int chroma = 0;
 
     int total_blocks = 0;
+    int total_blocks_32 = 0;
     size_t payload_size = 0;
     ComPtr<ID3D11Buffer> meta_buf;
     ComPtr<ID3D11UnorderedAccessView> uav_meta;

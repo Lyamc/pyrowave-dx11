@@ -1,7 +1,7 @@
-// D3D11 (cs_5_0) port of PyroWave shaders/dwt.comp @ a0d2e71 (PRECISION=1, FP16=0 variant):
-// FP32 math, FP16-packed (f32tof16) groupshared storage, CDF 9/7 lifting, 32x32 blocks + 4 texel apron.
-// The GLSL only uses subgroups to derive local_index (gl_SubgroupID*size+invocation), which is
-// exactly SV_GroupIndex here; all cross-lane exchange already goes through shared memory + barrier().
+// D3D11 (cs_5_0) port of PyroWave shaders/dwt.comp @ a0d2e71 (PRECISION=1, FP16=0).
+// The tile exchange is a global RWBuffer, not groupshared. On the HD 6670 the
+// groupshared tile matched this math for an 8-wide LL and split a 16-wide LL.
+// Four dispatches (phase 0..3) so a wave never reads a value another wave just wrote.
 cbuffer Push : register(b0)
 {
     int2 resolution;
@@ -9,11 +9,19 @@ cbuffer Push : register(b0)
     int2 aligned_resolution;
     uint dc_shift;
     float range_scale;
+    uint phase;
+    uint groups_x;
+    uint slot_stride;
+    uint coeff_pitch;
 };
 
 Texture2DArray<float> uTexture : register(t0);
 SamplerState uSampler : register(s0); // MIRROR addressing == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT
 RWTexture2DArray<float> uOutput : register(u0);
+RWBuffer<float> uScratch : register(u1);
+// Same values as uOutput, one float per texel. Quant reads this. Texture2D.Load
+// on the HD 6670 returns a bad texel once x or y passes 7 on a narrow band.
+RWBuffer<float> uCoeff : register(u2);
 
 #define APRON 4
 #define APRON_HALF 2
@@ -27,18 +35,23 @@ static const float DELTA = 0.443506852043971;
 static const float K = 1.230174104914001;
 static const float inv_K = 1.0 / 1.230174104914001;
 
-groupshared uint shared_block[(BLOCK_SIZE + 2 * APRON) / 2][(BLOCK_SIZE + 2 * APRON) + 1];
+#define SHARED_ROWS ((BLOCK_SIZE + 2 * APRON) / 2)
+#define SHARED_STRIDE 64
 static uint local_index;
+static uint read_base;
+static uint write_base;
 
 float2 load_shared(int y, int x)
 {
-    uint v = shared_block[y][x];
-    return float2(f16tof32(v & 0xffffu), f16tof32(v >> 16));
+    uint i = (read_base + uint(y * SHARED_STRIDE + x)) * 2u;
+    return float2(uScratch[i], uScratch[i + 1u]);
 }
 
 void store_shared(int y, int x, float2 v)
 {
-    shared_block[y][x] = f32tof16(v.x) | (f32tof16(v.y) << 16);
+    uint i = (write_base + uint(y * SHARED_STRIDE + x)) * 2u;
+    uScratch[i] = v.x;
+    uScratch[i + 1u] = v.y;
 }
 
 int2 unswizzle8x8(uint index)
@@ -50,23 +63,45 @@ int2 unswizzle8x8(uint index)
     return int2(x, y);
 }
 
-float2 generate_mirror_uv(int2 coord)
+// Integer mirror of generate_mirror_uv + Gather, matching map_coord in test_t6c.
+int mirror_coord(int i, int R)
 {
-    coord -= int2(coord < int2(0, 0));
-    coord += 1;
-    int2 end_mirrored_clamp = 2 * aligned_resolution - resolution;
-    int2 past_wrapped_coord = coord + 2 * (resolution - aligned_resolution) + 1;
-    coord = (coord >= end_mirrored_clamp) ? past_wrapped_coord : min(coord, resolution);
-    return float2(coord) * inv_resolution;
+    int p = R * 2;
+    int t = i % p;
+    if (t < 0) t += p;
+    return (t >= R) ? (p - 1 - t) : t;
+}
+
+int map_coord(int c, int R, int A)
+{
+    int g = c & ~1;
+    if (g < 0) g -= 1;
+    g += 1;
+    int endc = 2 * A - R;
+    int past = g + 2 * (R - A) + 1;
+    g = (g >= endc) ? past : min(g, R);
+    return ((c & 1) != 0) ? mirror_coord(g, R) : mirror_coord(g - 1, R);
+}
+
+float load_texel(int x, int y)
+{
+    x = map_coord(x, resolution.x, aligned_resolution.x);
+    y = map_coord(y, resolution.y, aligned_resolution.y);
+    float v = uTexture.Load(int4(x, y, 0, 0)).x;
+    v *= range_scale;
+    if (dc_shift != 0u) v -= 0.5;
+    return v;
 }
 
 float4 gather_texels(int2 coord)
 {
-    float4 t = uTexture.Gather(uSampler, float3(generate_mirror_uv(coord), 0.0)).wzxy;
-    t *= range_scale;
-    if (dc_shift != 0u)
-        t -= 0.5;
-    return t;
+    // Gather .wzxy footprint, stored later as vertical pairs (xz, yw):
+    // (x,y), (x+1,y), (x,y+1), (x+1,y+1).
+    return float4(
+        load_texel(coord.x, coord.y),
+        load_texel(coord.x + 1, coord.y),
+        load_texel(coord.x, coord.y + 1),
+        load_texel(coord.x + 1, coord.y + 1));
 }
 
 void load_image_with_apron(uint2 group_id)
@@ -122,8 +157,6 @@ void forward_transform8x2()
     [unroll] for (int i3 = 3; i3 < 13; i3 += 2) values[i3] += GAMMA * (values[i3 - 1] + values[i3 + 1]);
     [unroll] for (int i4 = 4; i4 < 12; i4 += 2) values[i4] += DELTA * (values[i4 - 1] + values[i4 + 1]);
 
-    GroupMemoryBarrierWithGroupSync(); // WAR hazard
-
     [unroll] for (int i5 = 2; i5 < 6; i5++)
     {
         float2 a = values[2 * i5 + 0] * inv_K;
@@ -152,8 +185,6 @@ void forward_transform4x2(bool active_lane, int y_offset)
         [unroll] for (int z = 0; z < 12; z++) values[z] = float2(0.0, 0.0);
     }
 
-    GroupMemoryBarrierWithGroupSync();
-
     if (active_lane)
     {
         [unroll] for (int i5 = 2; i5 < 4; i5++)
@@ -171,14 +202,28 @@ void forward_transform4x2(bool active_lane, int y_offset)
 void main(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 {
     local_index = gi;
-    load_image_with_apron(gid.xy);
-    GroupMemoryBarrierWithGroupSync();
-    forward_transform8x2();                              // horizontal
-    forward_transform4x2(local_index < 32u, BLOCK_SIZE_HALF); // horizontal, vertical-apron rows
-    GroupMemoryBarrierWithGroupSync();
-    forward_transform8x2();                              // vertical
-    GroupMemoryBarrierWithGroupSync();
+    uint tile = (gid.y * groups_x + gid.x) * (SHARED_ROWS * SHARED_STRIDE);
+    // phase 0 writes slot 0, phase 1 reads slot 0 and writes slot 1,
+    // phase 2 reads slot 1 and writes slot 0, phase 3 reads slot 0.
+    read_base = tile + ((phase == 2u) ? slot_stride : 0u);
+    write_base = tile + ((phase == 1u) ? slot_stride : 0u);
 
+    if (phase == 0u) {
+        load_image_with_apron(gid.xy);
+        return;
+    }
+    if (phase == 1u) {
+        forward_transform8x2();
+        forward_transform4x2(local_index < 32u, BLOCK_SIZE_HALF);
+        return;
+    }
+    if (phase == 2u) {
+        forward_transform8x2();
+        return;
+    }
+
+    int out_w = aligned_resolution.x >> 1;
+    int out_h = aligned_resolution.y >> 1;
     int2 lc = unswizzle8x8(local_index);
     for (int y = lc.y; y < BLOCK_SIZE_HALF; y += 8)
     {
@@ -187,10 +232,19 @@ void main(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
             float2 v0 = load_shared(y, x + 0);
             float2 v1 = load_shared(y, x + 1);
             int2 c = int2(gid.xy) * (BLOCK_SIZE / 2) + int2(x >> 1, y);
-            uOutput[int3(c, 0)] = v0.x; // LL
-            uOutput[int3(c, 2)] = v0.y; // horiz low / vert high
-            uOutput[int3(c, 1)] = v1.x; // horiz high / vert low
-            uOutput[int3(c, 3)] = v1.y; // HH
+            if ((uint)c.x < (uint)out_w && (uint)c.y < (uint)out_h) {
+                uOutput[int3(c, 0)] = v0.x; // LL
+                uOutput[int3(c, 2)] = v0.y; // horiz low / vert high
+                uOutput[int3(c, 1)] = v1.x; // horiz high / vert low
+                uOutput[int3(c, 3)] = v1.y; // HH
+                uint pitch_h = (uint(out_h) + 31u) & ~31u;
+                uint base = uint(c.y) * coeff_pitch + uint(c.x);
+                uint layer_stride = coeff_pitch * pitch_h;
+                uCoeff[0u * layer_stride + base] = v0.x;
+                uCoeff[2u * layer_stride + base] = v0.y;
+                uCoeff[1u * layer_stride + base] = v1.x;
+                uCoeff[3u * layer_stride + base] = v1.y;
+            }
         }
     }
 }

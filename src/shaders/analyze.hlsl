@@ -71,7 +71,7 @@ uint distortion_to_bucket(float d, float cost, float d_base, float cost_base)
 }
 
 [numthreads(64, 1, 1)]
-void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)
 {
     // ------------------------------------------------------------------
     // Thread mapping (ar:149-157)

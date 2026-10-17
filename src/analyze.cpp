@@ -58,18 +58,18 @@ pwd3d11_result analyze_create(AnalyzeState *st, ID3D11Device *dev, int W, int H,
 // ------------------------------------------------------------------
 // Set block stats buffer (from quant stage output)
 // ------------------------------------------------------------------
-pwd3d11_result analyze_set_stats(AnalyzeState *st, ID3D11Buffer *stats_buffer, int total_blocks)
+pwd3d11_result analyze_set_stats(AnalyzeState *st, ID3D11Buffer *stats_buffer,
+                                  int count_8x8, int count_32x32)
 {
-    if (!stats_buffer || !st) return PWD3D11_ERROR_INVALID_ARGUMENT;
+    if (!stats_buffer || !st || count_8x8 <= 0 || count_32x32 <= 0) return PWD3D11_ERROR_INVALID_ARGUMENT;
 
     st->stats_buf = stats_buffer;
-    st->total_blocks_32x32 = total_blocks;
+    st->total_blocks_32x32 = count_32x32;
 
-    // Create SRV
     D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
     sd.Format = DXGI_FORMAT_R32_UINT;
     sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
-    sd.Buffer.NumElements = UINT(total_blocks * 16); // 64 bytes = 16 uints per block
+    sd.Buffer.NumElements = UINT(count_8x8 * 16); // 64 bytes = 16 uints per 8x8 block
 
     HRESULT hr = st->device->CreateShaderResourceView(stats_buffer, &sd, &st->srv_stats);
     return SUCCEEDED(hr) ? PWD3D11_SUCCESS : PWD3D11_ERROR_GENERIC;
@@ -141,6 +141,7 @@ pwd3d11_result analyze_compile_shaders(AnalyzeState *st)
     if (!st->device) return PWD3D11_ERROR_INVALID_ARGUMENT;
 
     // Analyze shader
+    if (st->analyze_shader && st->finalize_shader) return PWD3D11_SUCCESS;
     HRESULT hr = st->device->CreateComputeShader(
         const_cast<unsigned char*>(g_analyze_dxbc),
         g_analyze_dxbc_len,

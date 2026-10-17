@@ -22,12 +22,13 @@ cbuffer PushConstants : register(b0) {
     int   block_offset;
     int   block_stride;
     float rdo_distortion_scale;
+    uint  coeff_pitch;
 };
 
 // ------------------------------------------------------------------
 // Resources
 // ------------------------------------------------------------------
-Texture2DArray<float> t0 : register(t0);
+ByteAddressBuffer t0 : register(t0);
 RWByteAddressBuffer u0 : register(u0);
 RWByteAddressBuffer u1 : register(u1);
 RWByteAddressBuffer u2 : register(u2);
@@ -52,6 +53,17 @@ groupshared int    gs_group_base[1];
 groupshared uint   gs_staging[640];
 groupshared int    gs_overflow[1];
 groupshared uint   gs_payload_counter[1]; // groupshared counter for payload bytes
+groupshared uint   gs_pcode[128];
+
+// Coefficient buffer written by the DWT store. Out-of-range texels are 0,
+// matching Texture2D.Load.
+float band_at(int layer, int x, int y)
+{
+    if ((uint)x >= (uint)resolution.x || (uint)y >= (uint)resolution.y) return 0.0f;
+    uint pitch_h = (uint(resolution.y) + 31u) & ~31u;
+    uint idx = uint(layer) * coeff_pitch * pitch_h + uint(y) * coeff_pitch + uint(x);
+    return asfloat(t0.Load(idx * 4u));
+}
 
 // ------------------------------------------------------------------
 // Helper: build 2^q by bit manipulation (exact)
@@ -118,55 +130,57 @@ uint compute_q_stats(int thread_idx, int q, int msb_val, int block4x2_max_val, f
     return uint(late_bits & 0xffff);
 }
 
-[numthreads(128, 1, 1)]
-void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)
+[numthreads(8, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)
 {
-    // Zero groupshared staging array (spec P0)
-    for (int zi = gi; zi < 640; zi += 128) {
+    // One 8x8 per group. A 32x32 group put clusters 1..15 at groupshared
+    // indices >= 8, and on the HD 6670 those clusters encoded a 16-wide LL
+    // as a half-scale copy of the left edge. The texture itself is a ramp.
+    for (int zi = int(gi); zi < 640; zi += 8) {
         gs_staging[zi] = 0u;
     }
-    for (int zj = gi; zj < 2; zj += 128) {
-        gs_overflow[zj] = 0;
-        gs_payload_counter[zj] = 0u;
+    if (gi == 0u) {
+        gs_overflow[0] = 0;
+        gs_payload_counter[0] = 0u;
+        [unroll] for (int c = 0; c < 16; c++) gs_ctotal[c] = 0;
     }
     GroupMemoryBarrierWithGroupSync();
     // ------------------------------------------------------------------
-    // Thread mapping (wq:294-306)
+    // Thread mapping. gid is the 8x8 block, gi is the lane inside it.
     // ------------------------------------------------------------------
-    uint cluster = gi >> 3;
-    uint block_x = cluster & 3;
-    uint block_y = cluster >> 2;
-    uint lane = gi & 7;
+    uint cluster = 0u;
+    uint block_x = 0u;
+    uint block_y = 0u;
+    uint lane = gi;
     uint local_coord_x = 4 * (lane >> 2);
     uint local_coord_y = 2 * (lane & 3);
-    int2 coord = int2(int(gid.x) * 32 + int(8 * block_x + local_coord_x), int(gid.y) * 32 + int(8 * block_y + local_coord_y));
+    int2 coord = int2(int(gid.x) * 8 + int(local_coord_x), int(gid.y) * 8 + int(local_coord_y));
     uint ublock_x = block_x;
     uint ublock_y = block_y;
 
-    // ------------------------------------------------------------------
-    // Bounds check (wq:313)
-    // ------------------------------------------------------------------
-    bool in_bounds = (int(block_x) < resolution_8x8_blocks.x) && (int(block_y) < resolution_8x8_blocks.y);
+    int2 block8 = int2(gid.xy);
+    bool in_bounds = (block8.x < resolution_8x8_blocks.x) && (block8.y < resolution_8x8_blocks.y);
+    uint block_linear = uint(block_offset) + uint(block_stride) * uint(block8.y) + uint(block8.x);
+    int layer = (int)input_layer;
 
     // ------------------------------------------------------------------
-    // P0: Load texels, scale, compute m_sub -> gs_max (wq:308-312, 172-175)
-    // Gather offset (1,1) / (3,1): read 2x2 blocks and reorder to wxzy
-    // Load(int4(x,y,layer,0)).x gives texel at (x,y) in layer 0
+    // P0: Load texels from the DWT coefficient buffer. Texture2D.Load on the
+    // HD 6670 disagrees with the UAV store once x or y passes 7.
+    // 4x2 pixel order is 0 2 4 6 / 1 3 5 7: (x,y), (x,y+1), (x+1,y), (x+1,y+1).
     // ------------------------------------------------------------------
     int cx = int(coord.x);
     int cy = int(coord.y);
-    // t0a: 2x2 block at (cx, cy) -> wxzy order
-    float t0a_x = t0.Load(int4(cx, cy, 0, 0)).x;
-    float t0a_y = t0.Load(int4(cx + 1, cy, 0, 0)).x;
-    float t0a_z = t0.Load(int4(cx, cy + 1, 0, 0)).x;
-    float t0a_w = t0.Load(int4(cx + 1, cy + 1, 0, 0)).x;
+
+    float t0a_x = band_at(layer, cx, cy);
+    float t0a_y = band_at(layer, cx, cy + 1);
+    float t0a_z = band_at(layer, cx + 1, cy);
+    float t0a_w = band_at(layer, cx + 1, cy + 1);
     precise float4 t0a = float4(t0a_x, t0a_y, t0a_z, t0a_w);
 
-    // t0b: 2x2 block at (cx+2, cy) -> wxzy order
-    float t0b_x = t0.Load(int4(cx + 2, cy, 0, 0)).x;
-    float t0b_y = t0.Load(int4(cx + 3, cy, 0, 0)).x;
-    float t0b_z = t0.Load(int4(cx + 2, cy + 1, 0, 0)).x;
-    float t0b_w = t0.Load(int4(cx + 3, cy + 1, 0, 0)).x;
+    float t0b_x = band_at(layer, cx + 2, cy);
+    float t0b_y = band_at(layer, cx + 2, cy + 1);
+    float t0b_z = band_at(layer, cx + 3, cy);
+    float t0b_w = band_at(layer, cx + 3, cy + 1);
     precise float4 t0b = float4(t0b_x, t0b_y, t0b_z, t0b_w);
 
     precise float4 s0 = t0a * quant_resolution;
@@ -187,11 +201,8 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint g
     // ------------------------------------------------------------------
     // P1: m_wave, code, qs, scaled s, ints, msb, active, early(0)
     // ------------------------------------------------------------------
-    float m_wave = gs_max[gi];
-    if (lane & 1) m_wave = max(m_wave, gs_max[gi ^ 1]);
-    if (lane & 2) m_wave = max(m_wave, gs_max[gi ^ 2]);
-    if (lane & 4) m_wave = max(m_wave, gs_max[gi ^ 4]);
-    m_wave = gs_max[gi];
+    // Cluster max across the 8 lanes. Read the originals; xor 1/2/4 stays inside the cluster.
+    float m_wave = max(max(gs_max[gi], gs_max[gi ^ 1u]), max(gs_max[gi ^ 2u], gs_max[gi ^ 4u]));
 
     uint quant_code = 6;
     float quant_scale = 1.0f;
@@ -225,12 +236,11 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint g
     bool active = in_bounds && (max_abs != 0);
     gs_early[gi] = 0;
 
-    if (gi == 0) {
-        uint block_index = uint(block_offset) + uint(block_y) * uint(block_stride) + uint(block_x);
-        if (!active) {
-            u0.Store4(int(block_index * 8), uint4(0, 0, 0, 0));
-            u1.Store4(int(block_index * 64 + 0), uint4(0, 0, 0, 0));
-        }
+    if (lane == 0u && in_bounds && !active) {
+        u0.Store(int(block_linear * 8u), 0u);
+        u0.Store(int(block_linear * 8u + 4u), 0u);
+        u1.Store(int(block_linear * 64u), 0u);
+        u1.Store(int(block_linear * 64u + 4u), 0u);
     }
 
     int msb = active ? int(firstbithigh(uint(max_abs))) : -1;
@@ -248,8 +258,14 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint g
             quality_planes = msb_q - 2;
             block4x2_max >>= quality_planes;
         }
+        // Match wavelet_quant.comp: once quality planes exist, the sign byte
+        // replaces the (block>0) bit. Adding quality_planes on top drops that
+        // byte for lanes whose own max shifts to zero, and the next lane's
+        // payload overlaps.
         int encode_cost_early = (block4x2_max > 0) ? 1 : 0;
-        encode_cost_early += quality_planes;
+        if (msb_q >= 3) {
+            encode_cost_early = quality_planes + 1;
+        }
         encode_cost_early += int(firstbithigh(uint(block4x2_max))) + 1;
         early_t = encode_cost_early;
         qp_t = quality_planes;
@@ -261,48 +277,31 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint g
     // Barrier 2
     GroupMemoryBarrierWithGroupSync();
 
-    // ------------------------------------------------------------------
-    // P2: Cluster exclusive scan of gs_early + cluster total
-    // ------------------------------------------------------------------
-    if (active) {
-        int v = early_t;
-        if (lane >= 1) v += gs_early[gi ^ 1];
-        if (lane >= 2) v += gs_early[gi ^ 2];
-        if (lane >= 4) v += gs_early[gi ^ 4];
-        gs_early[gi] = v - early_t;
+    // Exclusive prefix of the 8 lane costs. The old xor scan mixed lanes 2 and 3.
+    int scan_excl = 0;
+    int cluster_sum = 0;
+    {
+        uint base_lane = gi & ~7u;
+        [unroll] for (uint sum_i = 0u; sum_i < 8u; sum_i++) cluster_sum += gs_early[base_lane + sum_i];
+        [unroll] for (uint pref_i = 0u; pref_i < lane; pref_i++) scan_excl += gs_early[base_lane + pref_i];
     }
-
-    int cluster_total = 0;
-    if (lane == 7 && active) {
-        int v = gs_early[gi];
-        if (lane & 1) v += gs_early[gi ^ 1];
-        if (lane & 2) v += gs_early[gi ^ 2];
-        if (lane & 4) v += gs_early[gi ^ 4];
-        cluster_total = v;
-    }
-
-    // Barrier 3
+    if (lane == 7u) gs_ctotal[cluster] = uint(cluster_sum);
     GroupMemoryBarrierWithGroupSync();
 
-    if (gi == 0) {
-        gs_ctotal[cluster] = cluster_total;
-    }
-
     // ------------------------------------------------------------------
-    // P3: Sum totals, round up to 4-byte, compute group_base
+    // P3: Sum totals, round up to 4-byte, allocate payload bytes at u2 offset 0
     // Use groupshared counter since RWByteAddressBuffer doesn't support
     // InterlockedAdd in fxc cs_5_0 — we write to u2 after the barrier.
     // ------------------------------------------------------------------
     int group_base = 0;
 
-    if (gi == 0) {
-        int total = 0;
-        for (int c = 0; c < 16; c++) {
-            total += gs_ctotal[c];
-        }
-        if (total > 0) total = (total + 3) & ~3;
-        gs_payload_counter[0] = uint(total);
-        gs_group_base[0] = 0; // placeholder, set after barrier from u2 readback
+    if (gi == 0u) {
+        uint total = uint(gs_ctotal[0]);
+        if (total > 0u) total = (total + 3u) & ~3u;
+        uint base_byte = 0u;
+        if (total > 0u) u2.InterlockedAdd(0, total, base_byte);
+        gs_payload_counter[0] = total;
+        gs_group_base[0] = base_byte;
     }
 
     // Barrier 4
@@ -319,20 +318,8 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint g
     // P4: cluster_base, payload bytes, meta, stats
     // ------------------------------------------------------------------
     int cluster_base = group_base;
+    for (uint pc = 0u; pc < cluster; pc++) cluster_base += int(gs_ctotal[pc]);
     if (active) {
-        for (int c = 0; c < 16; c++) {
-            cluster_base += gs_ctotal[c];
-        }
-
-        int scan_excl = 0;
-        if (lane > 0) {
-            int v = 0;
-            if (lane >= 1) v += gs_early[gi ^ 1];
-            if (lane >= 2) v += gs_early[gi ^ 2];
-            if (lane >= 4) v += gs_early[gi ^ 4];
-            scan_excl = v - early_t;
-        }
-
         // Write payload bytes
         bool need_sign = (sh_t != 0) || (qp_t != 0);
         if (need_sign && early_t > 0) {
@@ -377,40 +364,50 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint g
         }
     }
 
+    // Each lane publishes its own 2-bit plane code. Lane 0 merges the cluster.
+    gs_pcode[gi] = 0u;
+    if (active) {
+        int pc = int(firstbithigh(uint(sh_t))) + 1;
+        if (pc < 0) pc = 0;
+        gs_pcode[gi] = uint(pc);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
     // Lane 0: meta, num_planes, errors[0], errors[msb+1]
-    if (gi == 0 && active) {
-        uint block_index = uint(block_offset) + uint(block_y) * uint(block_stride) + uint(block_x);
+    if (lane == 0u && active) {
+        uint block_index = block_linear;
 
         uint code_word = uint(qp_t) << Q_PLANES_OFFSET;
         code_word |= (quant_code << QUANT_SCALE_OFFSET);
 
-        int plane_code = int(firstbithigh(uint(sh_t))) + 1;
-        uint merged = uint(plane_code) << (2 * lane);
-        merged |= uint(plane_code) << (2 * (lane ^ 1));
-        merged |= uint(plane_code) << (2 * (lane ^ 2));
-        merged |= uint(plane_code) << (2 * (lane ^ 4));
+        uint merged = 0u;
+        [unroll] for (uint lane_i = 0u; lane_i < 8u; lane_i++)
+            merged |= gs_pcode[gi + lane_i] << (2u * lane_i);
         code_word |= merged;
 
-        u0.Store4(int(block_index * 8), uint4(code_word, cluster_base, 0, 0));
+        u0.Store(int(block_index * 8u), code_word);
+        u0.Store(int(block_index * 8u + 4u), uint(cluster_base));
 
-        // Compute num_sig(0) cluster sum
+        // num_sig(0) over this cluster's 8 threads, 8 texels each.
         int wave8_num_significants = 0;
-        for (int t = 0; t < 8; t++) {
-            float4 sv0 = gs_tex[t][0];
-            float4 sv1 = gs_tex[t][4];
+        for (int sig_i = 0; sig_i < 8; sig_i++) {
             int sig = 0;
-            sig += (abs(sv0.x) >= 1.0f) ? 1 : 0;
-            sig += (abs(sv0.y) >= 1.0f) ? 1 : 0;
-            sig += (abs(sv0.z) >= 1.0f) ? 1 : 0;
-            sig += (abs(sv0.w) >= 1.0f) ? 1 : 0;
-            sig += (abs(sv1.x) >= 1.0f) ? 1 : 0;
-            sig += (abs(sv1.y) >= 1.0f) ? 1 : 0;
-            sig += (abs(sv1.z) >= 1.0f) ? 1 : 0;
-            sig += (abs(sv1.w) >= 1.0f) ? 1 : 0;
+            for (int kk = 0; kk < 8; kk++) {
+                if (abs(gs_tex[gi + uint(sig_i)][kk]) >= 1.0f) sig++;
+            }
             wave8_num_significants += sig;
         }
 
-        int late_bits_0 = 8 * max(early_t - 1, 0) + wave8_num_significants;
+        // encode_cost_late_bits is a clustered sum, not lane 0 alone.
+        // Lane 0 only made pack allocate a few words, then the decoder
+        // walked off the end of the block into the next header.
+        int mag_bytes = 0;
+        {
+            uint base_lane = gi & ~7u;
+            [unroll] for (uint mb = 0u; mb < 8u; mb++)
+                mag_bytes += max(gs_early[base_lane + mb] - 1, 0);
+        }
+        int late_bits_0 = 8 * mag_bytes + wave8_num_significants;
         uint errors_0 = uint(late_bits_0 & 0xffff) << 16;
 
         uint num_planes = uint(msb + 1);
@@ -427,10 +424,10 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint g
 
         float square_sum = 0.0f;
         for (int ti = 0; ti < 8; ti++) {
-            square_sum += gs_tex[ti][0]*gs_tex[ti][0] + gs_tex[ti][1]*gs_tex[ti][1] +
-                          gs_tex[ti][2]*gs_tex[ti][2] + gs_tex[ti][3]*gs_tex[ti][3] +
-                          gs_tex[ti][4]*gs_tex[ti][4] + gs_tex[ti][5]*gs_tex[ti][5] +
-                          gs_tex[ti][6]*gs_tex[ti][6] + gs_tex[ti][7]*gs_tex[ti][7];
+            for (int kk = 0; kk < 8; kk++) {
+                float tv = gs_tex[gi + uint(ti)][kk];
+                square_sum += tv * tv;
+            }
         }
         square_sum *= inv_quant_sq;
 
@@ -454,7 +451,7 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint g
                     float thread_err = 0.0f;
                     int thread_sig = 0;
                     for (int kk = 0; kk < 8; kk++) {
-                        float v = abs(gs_tex[ti][kk]);
+                        float v = abs(gs_tex[gi + uint(ti)][kk]);
                         float iv = floor(v * make_pow2(-q));
                         iv += (iv != 0.0f) ? 0.5f : 0.0f;
                         iv = trunc(iv * make_pow2(q));
@@ -473,7 +470,7 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint g
 
                 // Compute late_bits for this q
                 for (int tj = 0; tj < 8; tj++) {
-                    int b4x2_t = gs_b4x2[tj];
+                    int b4x2_t = gs_b4x2[gi + uint(tj)];
                     int shifted = b4x2_t >> q;
                     int msb_q = msb - q;
                     int qp_local = 0;
@@ -482,13 +479,13 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint g
                         shifted >>= qp_local;
                     }
                     int enc_early = (shifted > 0) ? 1 : 0;
-                    enc_early += qp_local;
+                    if (msb_q >= 3) enc_early = qp_local + 1;
                     enc_early += int(firstbithigh(uint(shifted))) + 1;
 
                     // Recompute thread_sig for this q
                     int t_sig = 0;
                     for (int kk = 0; kk < 8; kk++) {
-                        float v = abs(gs_tex[tj][kk]);
+                        float v = abs(gs_tex[gi + uint(tj)][kk]);
                         float scaled = v * make_pow2(-q);
                         t_sig += (scaled >= 1.0f) ? 1 : 0;
                     }
@@ -508,26 +505,9 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint g
     // ------------------------------------------------------------------
     // P5: Copy staging words to u2
     // ------------------------------------------------------------------
-    int words_to_copy = 0;
-    if (gi == 0) {
-        int total = 0;
-        for (int c = 0; c < 16; c++) total += gs_ctotal[c];
-        words_to_copy = (total + 3) >> 2; // rounded up
-    }
-
-    // Broadcast
-    int my_words = words_to_copy;
-
-    // Each thread copies a chunk
-    int chunk = (my_words >> 7) + 1; // my_words / 128 + 1
-    int start_word = gi * chunk;
-    int end_word = (gi + 1) * chunk;
-    if (end_word > my_words) end_word = my_words;
-
-    for (int ci = start_word; ci < end_word; ci++) {
-        if (ci < 640) {
-            u2.Store(int(8 + group_base + ci * 4), gs_staging[ci]);
-        }
+    int my_words = int(gs_payload_counter[0]) >> 2;
+    for (int ci = int(gi); ci < my_words; ci += 8) {
+        if (ci < 640) u2.Store(int(8 + group_base + ci * 4), gs_staging[ci]);
     }
 
     // Flush

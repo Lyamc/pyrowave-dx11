@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -73,8 +74,12 @@ struct PushConstants {
     int ax, ay;
     uint32_t dc;
     float rs;
+    uint32_t phase;
+    uint32_t groups_x;
+    uint32_t slot_stride;
+    uint32_t coeff_pitch;
 };
-static_assert(sizeof(PushConstants) == 32, "PushConstants must be 32 bytes");
+static_assert(sizeof(PushConstants) == 48, "PushConstants must be 48 bytes");
 
 // ------------------------------------------------------------------
 // Helper: create a 1-layer Texture2DArray SRV (layer 0 only)
@@ -100,8 +105,14 @@ static BandTex make_band(ID3D11Device *dev, int w, int h, DXGI_FORMAT f)
     BandTex o;
     o.w = w; o.h = h; o.fmt = f;
 
+    // Logical size stays w,h. The texture is padded to 32. Quant does not read
+    // it: Texture2D.Load on the HD 6670 is wrong past x or y of 7, and padding
+    // the desc did not change that. The coefficient buffer below is the copy
+    // the DWT store writes and quant reads.
+    o.pitch = (w + 31) & ~31;
+    int pitch_h = (h + 31) & ~31;
     D3D11_TEXTURE2D_DESC td = {};
-    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 4;
+    td.Width = UINT(o.pitch); td.Height = UINT(pitch_h); td.MipLevels = 1; td.ArraySize = 4;
     td.Format = f; td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
@@ -133,6 +144,31 @@ static BandTex make_band(ID3D11Device *dev, int w, int h, DXGI_FORMAT f)
     D3D11_SHADER_RESOURCE_VIEW_DESC sd0 = sd;
     sd0.Texture2DArray.ArraySize = 1;
     hr = dev->CreateShaderResourceView(o.tex.Get(), &sd0, &o.srv_layer0);
+    if (FAILED(hr)) return BandTex{};
+
+    UINT elems = 4u * UINT(o.pitch) * UINT(pitch_h);
+    D3D11_BUFFER_DESC cbd = {};
+    cbd.ByteWidth = elems * 4u;
+    cbd.Usage = D3D11_USAGE_DEFAULT;
+    cbd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+    cbd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+    hr = dev->CreateBuffer(&cbd, nullptr, &o.coeff);
+    if (FAILED(hr)) return BandTex{};
+
+    D3D11_UNORDERED_ACCESS_VIEW_DESC cud = {};
+    cud.Format = DXGI_FORMAT_R32_FLOAT;
+    cud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    cud.Buffer.NumElements = elems;
+    hr = dev->CreateUnorderedAccessView(o.coeff.Get(), &cud, &o.coeff_uav);
+    if (FAILED(hr)) return BandTex{};
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC csd = {};
+    csd.Format = DXGI_FORMAT_R32_TYPELESS;
+    csd.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+    csd.BufferEx.NumElements = elems;
+    csd.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+    hr = dev->CreateShaderResourceView(o.coeff.Get(), &csd, &o.coeff_srv);
+    if (FAILED(hr)) return BandTex{};
 
     return o;
 }
@@ -298,7 +334,8 @@ pwd3d11_result dwt_create(DWTState *st, pwd3d11_device dev, int W, int H, int ch
 pwd3d11_result dwt_compile_shader(DWTState *st)
 {
     if (!st->device) return PWD3D11_ERROR_INVALID_ARGUMENT;
-    HRESULT hr = create_dwt_shader(st->device.Get(), &st->shader);
+    if (st->shader) return PWD3D11_SUCCESS;
+    HRESULT hr = create_dwt_shader(st->device.Get(), st->shader.GetAddressOf());
     return SUCCEEDED(hr) ? PWD3D11_SUCCESS : PWD3D11_ERROR_GENERIC;
 }
 
@@ -362,9 +399,15 @@ pwd3d11_result dwt_create_bands(DWTState *st)
         for (int l = start_level; l < Levels; l++) {
             int bw = st->aw >> (l + 1);
             int bh = st->ah >> (l + 1);
-            DXGI_FORMAT fmt = (l < 2) ? DXGI_FORMAT_R16_FLOAT : DXGI_FORMAT_R32_FLOAT;
+            // The shader UAV is RWTexture2DArray<float>, which is R32_FLOAT.
+            // R16_FLOAT on levels 0 and 1 stored the wrong bits on the HD 6670
+            // and the decoder reconstructed those bands as color noise.
+            DXGI_FORMAT fmt = DXGI_FORMAT_R32_FLOAT;
             st->bands[c][l] = make_band(st->device.Get(), bw, bh, fmt);
             if (!st->bands[c][l].tex) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
+            float zero[4] = {};
+            st->context->ClearUnorderedAccessViewFloat(st->bands[c][l].uav.Get(), zero);
+            st->context->ClearUnorderedAccessViewFloat(st->bands[c][l].coeff_uav.Get(), zero);
         }
     }
     return PWD3D11_SUCCESS;
@@ -381,7 +424,33 @@ pwd3d11_result dwt_run(DWTState *st)
     ID3D11ComputeShader *cs = st->shader.Get();
     ID3D11SamplerState *smp = st->sampler.Get();
     ID3D11ShaderResourceView *nullsrv = nullptr;
-    ID3D11UnorderedAccessView *nulluav = nullptr;
+    ID3D11UnorderedAccessView *nulluav[3] = { nullptr, nullptr, nullptr };
+
+    // Largest grid is luma level 0. Each group holds a 20*64 float2 tile,
+    // and the horizontal pass writes a second slot.
+    const uint32_t tile = 20u * 64u;
+    uint32_t max_gx = (uint32_t(st->aw) + 31u) / 32u;
+    uint32_t max_gy = (uint32_t(st->ah) + 31u) / 32u;
+    uint32_t need_floats = max_gx * max_gy * tile * 2u * 2u;
+    if (!st->scratch_uav || st->scratch_floats < need_floats) {
+        D3D11_BUFFER_DESC sbd = {};
+        sbd.ByteWidth = need_floats * 4u;
+        sbd.Usage = D3D11_USAGE_DEFAULT;
+        sbd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        ComPtr<ID3D11Buffer> buf;
+        HRESULT hr = st->device->CreateBuffer(&sbd, nullptr, &buf);
+        if (FAILED(hr)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format = DXGI_FORMAT_R32_FLOAT;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer.NumElements = need_floats;
+        ComPtr<ID3D11UnorderedAccessView> uav;
+        hr = st->device->CreateUnorderedAccessView(buf.Get(), &ud, &uav);
+        if (FAILED(hr)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
+        st->scratch = buf;
+        st->scratch_uav = uav;
+        st->scratch_floats = need_floats;
+    }
 
     ctx->CSSetShader(cs, nullptr, 0);
     ctx->CSSetSamplers(0, 1, &smp);
@@ -391,6 +460,8 @@ pwd3d11_result dwt_run(DWTState *st)
     struct DispatchEntry {
         ID3D11ShaderResourceView *srv;
         ID3D11UnorderedAccessView *uav;
+        ID3D11UnorderedAccessView *coeff;
+        uint32_t coeff_pitch;
         int rx, ry, ax, ay;
         uint32_t dc_shift;
         float range_scale;
@@ -400,10 +471,12 @@ pwd3d11_result dwt_run(DWTState *st)
     std::vector<DispatchEntry> disps;
 
     // Helper to add a dispatch
-    auto add_disp = [&](ID3D11ShaderResourceView *srv, ID3D11UnorderedAccessView *uav,
+    auto add_disp = [&](ID3D11ShaderResourceView *srv, const BandTex &band,
                         int rx, int ry, int ax, int ay, bool dc, float rs) {
         DispatchEntry e;
-        e.srv = srv; e.uav = uav;
+        e.srv = srv; e.uav = band.uav.Get();
+        e.coeff = band.coeff_uav.Get();
+        e.coeff_pitch = uint32_t(band.pitch);
         e.rx = rx; e.ry = ry; e.ax = ax; e.ay = ay;
         e.dc_shift = dc ? 1u : 0u;
         e.range_scale = rs;
@@ -413,7 +486,7 @@ pwd3d11_result dwt_run(DWTState *st)
     };
 
     // L0: Y component (dc_shift=1, range_scale from buffer)
-    add_disp(st->plane_srv[0].Get(), st->bands[0][0].uav.Get(),
+    add_disp(st->plane_srv[0].Get(), st->bands[0][0],
              st->pw[0], st->ph[0], st->aw, st->ah, true, 1.0f);
 
     // L1..4: for each level, components 0, 1, 2
@@ -424,11 +497,11 @@ pwd3d11_result dwt_run(DWTState *st)
 
             if (is_chroma_l1) {
                 // Chroma L1: input is the chroma plane
-                add_disp(st->plane_srv[c].Get(), st->bands[c][l].uav.Get(),
+                add_disp(st->plane_srv[c].Get(), st->bands[c][l],
                          st->pw[c], st->ph[c], st->aw >> 1, st->ah >> 1, true, 1.0f);
             } else {
                 // Use LL band (layer 0) from previous level of same component
-                add_disp(st->bands[c][l - 1].srv_layer0.Get(), st->bands[c][l].uav.Get(),
+                add_disp(st->bands[c][l - 1].srv_layer0.Get(), st->bands[c][l],
                          st->bands[c][l - 1].w, st->bands[c][l - 1].h,
                          st->bands[c][l - 1].w, st->bands[c][l - 1].h, false, 1.0f);
             }
@@ -445,26 +518,33 @@ pwd3d11_result dwt_run(DWTState *st)
 
         PushConstants pc = {};
         pc.rx = d.rx; pc.ry = d.ry;
-        pc.ix = 1.0f / d.rx; pc.iy = 1.0f / d.ry;
+        pc.ix = 1.0f / float(d.rx); pc.iy = 1.0f / float(d.ry);
         pc.ax = d.ax; pc.ay = d.ay;
         pc.dc = d.dc_shift;
         pc.rs = d.range_scale;
+        pc.groups_x = d.gx;
+        pc.slot_stride = d.gx * d.gy * tile;
+        pc.coeff_pitch = d.coeff_pitch;
 
-        D3D11_SUBRESOURCE_DATA sd = {};
-        sd.pSysMem = &pc;
-
-        HRESULT hr = st->device->CreateBuffer(&bd, &sd, &cb);
-        if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
-
-        ctx->CSSetUnorderedAccessViews(0, 1, &d.uav, nullptr);
+        ID3D11UnorderedAccessView *uavs[3] = { d.uav, st->scratch_uav.Get(), d.coeff };
+        ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
         ctx->CSSetShaderResources(0, 1, &d.srv);
-        ctx->CSSetConstantBuffers(0, 1, cb.GetAddressOf());
-        ctx->Dispatch(d.gx, d.gy, 1);
+
+        for (uint32_t phase = 0; phase < 4; ++phase) {
+            pc.phase = phase;
+            D3D11_SUBRESOURCE_DATA sd = {};
+            sd.pSysMem = &pc;
+            HRESULT hr = st->device->CreateBuffer(&bd, &sd, &cb);
+            if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
+            ctx->CSSetConstantBuffers(0, 1, cb.GetAddressOf());
+            ctx->Dispatch(d.gx, d.gy, 1);
+            cb.Reset();
+        }
     }
 
     // Clear shader resources
     ctx->CSSetShaderResources(0, 1, &nullsrv);
-    ctx->CSSetUnorderedAccessViews(0, 1, &nulluav, nullptr);
+    ctx->CSSetUnorderedAccessViews(0, 3, nulluav, nullptr);
     ctx->Flush();
 
     return PWD3D11_SUCCESS;
@@ -618,7 +698,13 @@ void dwt_destroy(DWTState *st)
 ID3D11ShaderResourceView *dwt_get_band_srv(DWTState *st, int component, int level)
 {
     if (!st || component < 0 || component >= 3 || level < 0 || level >= Levels) return nullptr;
-    return st->bands[component][level].srv.Get();
+    return st->bands[component][level].coeff_srv.Get();
+}
+
+int dwt_get_band_pitch(DWTState *st, int component, int level)
+{
+    if (!st || component < 0 || component >= 3 || level < 0 || level >= Levels) return -1;
+    return st->bands[component][level].pitch;
 }
 
 int dwt_get_band_w(DWTState *st, int component, int level)

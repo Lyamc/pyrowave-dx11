@@ -39,27 +39,50 @@ struct QuantPushConstants {
     int   block_offset;           // @32
     int   block_stride;           // @36
     float rdo_distortion_scale;   // @40
-    float _pad;                   // @44
+    uint32_t coeff_pitch;         // @44
 };
 static_assert(sizeof(QuantPushConstants) == 48, "QuantPushConstants must be 48 bytes");
 
 // ------------------------------------------------------------------
 // Helper: get quant resolution for a band (R/pyrowave_encoder.cpp:148-176)
 // ------------------------------------------------------------------
-static float get_quant_resolution(int level, int component, int band, int chroma)
+static uint8_t encode_quant_code(float decoder_q_scale)
 {
-    // Simplified: returns a power of two <= 4096
-    // Full implementation would match R/pyrowave_encoder.cpp:148-176
-    // For now, use a reasonable default
-    (void)component; (void)band; (void)chroma;
-    switch (level) {
-        case 0: return 4096.0f;
-        case 1: return 2048.0f;
-        case 2: return 1024.0f;
-        case 3: return 512.0f;
-        case 4: return 256.0f;
-        default: return 4096.0f;
-    }
+    uint32_t v = 0;
+    memcpy(&v, &decoder_q_scale, sizeof(v));
+    int e = int((v >> 23) & 0xff) - 127 - 4;
+    int m = int((v >> 20) & 0x7);
+    e = -e;
+    if (e < 0) e = 0;
+    if (e > 20) e = 20;
+    return uint8_t((e << 3) | m);
+}
+
+static float decode_quant_code(uint8_t quant_code)
+{
+    int e = 4 - int(quant_code >> 3);
+    int m = int(quant_code & 0x7);
+    int shift = 20 + e;
+    float mag = float(8 + m);
+    if (shift >= 0) mag *= float(1 << shift);
+    else mag /= float(1 << -shift);
+    return mag / (8.0f * 1024.0f * 1024.0f);
+}
+
+// R/pyrowave_encoder.cpp get_noise_power_normalized_quant_resolution, capped at 4096.
+static float get_quant_resolution(int level, int component, int band, int /*chroma*/)
+{
+    int bits = 8;
+    if (band == 0) bits += 2;
+    else if (band < 3) bits += 1;
+    bits += level;
+    if (component != 0) bits--;
+    float quant_res = float(1 << bits);
+    if (quant_res > 4096.0f) quant_res = 4096.0f;
+    uint8_t code = encode_quant_code(1.0f / quant_res);
+    float decoded = decode_quant_code(code);
+    if (decoded == 0.0f) return quant_res;
+    return 1.0f / decoded;
 }
 
 // ------------------------------------------------------------------
@@ -110,16 +133,35 @@ pwd3d11_result quant_create(QuantState *st, pwd3d11_device dev, int W, int H, in
 // Set band textures (called after DWT completes)
 // ------------------------------------------------------------------
 pwd3d11_result quant_set_bands(QuantState *st, ID3D11ShaderResourceView * const *band_srvs,
-                                const int *band_w, const int *band_h, int num_bands)
+                                const int *band_w, const int *band_h, const int *band_pitch,
+                                const int *level, const int *component, const int *band,
+                                int num_bands)
 {
-    if (!st || !band_srvs) return PWD3D11_ERROR_INVALID_ARGUMENT;
+    if (!st || !band_srvs || !band_pitch || !level || !component || !band) return PWD3D11_ERROR_INVALID_ARGUMENT;
 
     st->bands.resize(num_bands);
+    int count8 = 0;
+    int count32 = 0;
     for (int i = 0; i < num_bands; i++) {
-        st->bands[i].srv = band_srvs[i];
-        st->bands[i].w = band_w[i];
-        st->bands[i].h = band_h[i];
+        auto &b = st->bands[i];
+        b.srv = band_srvs[i];
+        b.w = band_w[i];
+        b.h = band_h[i];
+        b.pitch = band_pitch[i];
+        b.level = level[i];
+        b.component = component[i];
+        b.band = band[i];
+        int b8x = (b.w + 7) / 8;
+        int b32x = (b.w + 31) / 32;
+        int b32y = (b.h + 31) / 32;
+        b.block_offset_8 = count8;
+        b.block_stride_8 = b8x;
+        b.block_offset_32 = count32;
+        b.block_stride_32 = b32x;
+        count8 += b8x * ((b.h + 7) / 8);
+        count32 += b32x * b32y;
     }
+    st->total_blocks_32 = count32;
     return PWD3D11_SUCCESS;
 }
 
@@ -130,7 +172,6 @@ pwd3d11_result quant_create_outputs(QuantState *st)
 {
     if (!st->device) return PWD3D11_ERROR_INVALID_ARGUMENT;
 
-    // Count total blocks
     int total_blocks = 0;
     for (auto &b : st->bands) {
         int bw = (b.w + 7) / 8;
@@ -138,6 +179,7 @@ pwd3d11_result quant_create_outputs(QuantState *st)
         total_blocks += bw * bh;
     }
     st->total_blocks = total_blocks;
+    if (total_blocks <= 0 || st->total_blocks_32 <= 0) return PWD3D11_ERROR_INVALID_ARGUMENT;
 
     // u0: BlockMeta (8 bytes per block)
     {
@@ -185,7 +227,8 @@ pwd3d11_result quant_create_outputs(QuantState *st)
     }
 
     // u2: Payload buffer (AW*AH*2 + padding)
-    st->payload_size = size_t(st->aw) * size_t(st->ah) * 2 + 4 * total_blocks + 8;
+    st->payload_size = size_t(st->aw) * size_t(st->ah) * 8 + size_t(total_blocks) * 64 + 256;
+    st->payload_size = (st->payload_size + 15u) & ~size_t(15);
 
     {
         D3D11_BUFFER_DESC bd = {};
@@ -217,6 +260,7 @@ pwd3d11_result quant_create_outputs(QuantState *st)
 pwd3d11_result quant_compile_shader(QuantState *st)
 {
     if (!st->device) return PWD3D11_ERROR_INVALID_ARGUMENT;
+    if (st->shader) return PWD3D11_SUCCESS;
 
     // Try embedded bytecode first
     HRESULT hr = st->device->CreateComputeShader(
@@ -269,33 +313,30 @@ pwd3d11_result quant_run(QuantState *st)
     ID3D11UnorderedAccessView *nulluav[3] = {nullptr, nullptr, nullptr};
 
     ctx->CSSetShader(cs, nullptr, 0);
+    UINT zero[4] = {};
+    ctx->ClearUnorderedAccessViewUint(st->uav_payload.Get(), zero);
+    ctx->ClearUnorderedAccessViewUint(st->uav_meta.Get(), zero);
+    ctx->ClearUnorderedAccessViewUint(st->uav_stats.Get(), zero);
 
-    int band_idx = 0;
     for (auto &b : st->bands) {
         int bw = b.w, bh = b.h;
-        int bw_8x8 = (bw + 7) / 8;
-        int bh_8x8 = (bh + 7) / 8;
+        if (bw <= 0 || bh <= 0) continue;
+        int bw_8 = (bw + 7) / 8;
+        int bh_8 = (bh + 7) / 8;
 
-        // Compute push constants
         QuantPushConstants pc = {};
         pc.resolution_x = bw;
         pc.resolution_y = bh;
-        pc.resolution_8x8_blocks_x = bw_8x8;
-        pc.resolution_8x8_blocks_y = bh_8x8;
-        pc.inv_resolution_x = 1.0f / bw;
-        pc.inv_resolution_y = 1.0f / bh;
-        pc.input_layer = float(band_idx);
-
-        // quant_resolution = 1.0f / decode_quant(encode_quant(1.0f / quant_res))
-        float quant_res = get_quant_resolution(b.level, b.component, 0, st->chroma);
-        // Simplified: quant_resolution = quant_res (identity for now)
-        pc.quant_resolution = quant_res;
-
-        // block_offset and block_stride are computed from band index
-        // For now, use a simple mapping
-        pc.block_offset = 0;
-        pc.block_stride = 0;
-        pc.rdo_distortion_scale = get_rdo_distortion_scale(b.level, b.component, 0, st->chroma);
+        pc.resolution_8x8_blocks_x = (bw + 7) / 8;
+        pc.resolution_8x8_blocks_y = (bh + 7) / 8;
+        pc.inv_resolution_x = 1.0f / float(bw);
+        pc.inv_resolution_y = 1.0f / float(bh);
+        pc.input_layer = float(b.band);
+        pc.quant_resolution = get_quant_resolution(b.level, b.component, b.band, st->chroma);
+        pc.block_offset = b.block_offset_8;
+        pc.block_stride = b.block_stride_8;
+        pc.rdo_distortion_scale = get_rdo_distortion_scale(b.level, b.component, b.band, st->chroma);
+        pc.coeff_pitch = uint32_t(b.pitch);
 
         // Create cbuffer
         ComPtr<ID3D11Buffer> cb;
@@ -312,9 +353,7 @@ pwd3d11_result quant_run(QuantState *st)
         ID3D11UnorderedAccessView *uavs[3] = { st->uav_meta.Get(), st->uav_stats.Get(), st->uav_payload.Get() };
         ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
 
-        ctx->Dispatch(bw_8x8, bh_8x8, 1);
-
-        band_idx++;
+        ctx->Dispatch(UINT(bw_8), UINT(bh_8), 1);
     }
 
     ctx->CSSetShaderResources(0, 1, &nullsrv);

@@ -69,6 +69,9 @@ groupshared uint gs_bits_meta[64];
 // gs_base: broadcast base from lane 15
 groupshared uint gs_base[4];
 
+// Sign bits, 64 per 8x8 lane (2 uints). Compacted after the copy.
+groupshared uint gs_sign[4][32];
+
 // Debug overflow counter
 groupshared uint gs_overflow[1];
 
@@ -141,22 +144,38 @@ uint load_payload_byte(RWByteAddressBuffer payload, uint idx)
     return (word >> (8u * ((idx + 8u) & 3u))) & 0xffu;
 }
 
+// Packet staging is local to the 32x32 block. Callers pass a byte offset
+// from the start of this block, never the global bitstream address.
+void pkt_put_byte(uint blk, uint local_byte, uint value)
+{
+    uint word_idx = local_byte >> 2u;
+    uint shift = (local_byte & 3u) << 3u;
+    uint idx = blk * MAX_PACKET_WORDS + word_idx;
+    uint mask = 0xffu << shift;
+    InterlockedAnd(gs_pkt[idx], ~mask);
+    InterlockedOr(gs_pkt[idx], (value & 0xffu) << shift);
+}
+
 // ------------------------------------------------------------------
 // Main
 // ------------------------------------------------------------------
 [numthreads(64, 1, 1)]
-void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)
+void main(uint3 grp : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)
 {
     // ------------------------------------------------------------------
     // P0: Zero staging arrays and ballot
     // ------------------------------------------------------------------
-    // Each thread zeros 40 words of its block's packet
-    uint blk = gi >> 4;  // Which 32x32 block (0..3)
-    for (uint w = gi; w < MAX_PACKET_WORDS; w += 64u) {
-        gs_pkt[blk * MAX_PACKET_WORDS + w] = 0u;
+    // Zero every staging word. The old loop only cleared 16 words per block,
+    // and it used the thread id as the word index, so blocks 1..3 lost their headers.
+    uint blk = gi >> 4;
+    for (uint w = gi; w < 4u * MAX_PACKET_WORDS; w += 64u) {
+        gs_pkt[w] = 0u;
     }
-    gs_ballot[blk] = 0u;
-    gs_base[blk] = 0u;
+    if (gi < 4u) {
+        gs_ballot[gi] = 0u;
+        gs_base[gi] = 0u;
+    }
+    for (uint s = gi; s < 128u; s += 64u) gs_sign[s >> 5u][s & 31u] = 0u;
     if (gi == 0u) gs_overflow[0] = 0u;
 
     GroupMemoryBarrierWithGroupSync();  // B1
@@ -169,9 +188,9 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint g
     uint local_x = local_block_index & 3u;
     uint local_y = local_block_index >> 2;
 
-    // Compute 32x32 block index
-    int block32x32_x = 2 * gid.y + int(local_block_index & 1u);
-    int block32x32_y = 2 * gid.x + (local_block_index >> 2);
+    // block_packing.comp: block32 = 2 * gl_WorkGroupID + (bit4, bit5 of the lane).
+    int block32x32_x = 2 * int(grp.x) + int((gi >> 4) & 1u);
+    int block32x32_y = 2 * int(grp.y) + int((gi >> 5) & 1u);
 
     // 8x8 block index
     int block8x8_x = 4 * block32x32_x + int(local_x);
@@ -187,21 +206,13 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint g
         quant = int(t2.Load(bo32 * 4));
     }
 
-    // Load block meta and stats
+    // Load the code word only. The payload offset is loaded once below,
+    // used before the next barrier, and republished through groupshared.
     uint code_word = 0u;
-    uint meta_offset = 0u;
-    uint num_bits_for_q = 0u;
 
     if (in_range_8x8) {
         int b8 = block_offset_8x8 + block_stride_8x8 * block8x8_y + block8x8_x;
         code_word = t0.Load(b8 * 8 + 0);
-        meta_offset = t0.Load(b8 * 8 + 4);
-
-        // Stats: num_planes at offset 0, errors[min(num_planes, quant)].payload_cost at offset 8
-        uint stats_base = uint(b8) * 64u;  // BlockStats = 64 bytes
-        uint num_planes = t1.Load(int(stats_base));
-        uint q = (quant < int(num_planes)) ? uint(quant) : num_planes;
-        num_bits_for_q = (t1.Load(int(stats_base + 8u + q * 8u)) >> 16u) & 0xffffu;
     }
 
     // Quantize code word
@@ -214,13 +225,14 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint g
         InterlockedOr(gs_ballot[blk], 1u << local_block_index);
     }
 
-    // Per-lane data
+    // 64 sign bits is one per coefficient. The real signs are packed tightly
+    // after the copy; this only reserves room. Do not load the payload offset
+    // here. A second Load of that address is folded into a value that does
+    // not survive the barrier, and every 8x8 then copies the first payload.
     uint plane_bytes = compute_required_8x8_size(code_word);
-    uint sign_bits = (active && num_bits_for_q > plane_bytes * 8u) ? (num_bits_for_q - plane_bytes * 8u) : 0u;
-    uint bits_meta = (num_bits_for_q != 0u) ? (num_bits_for_q + 24u) : 0u;
-
+    uint bits_meta = active ? (plane_bytes * 8u + 64u + 24u) : 0u;
     gs_plane_bytes[gi] = plane_bytes;
-    gs_sign_bits[gi] = sign_bits;
+    gs_sign_bits[gi] = 0u;
     gs_bits_meta[gi] = bits_meta;
 
     GroupMemoryBarrierWithGroupSync();  // B2
@@ -245,29 +257,17 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint g
         u2.InterlockedAdd(4, total_words, base);
     }
 
-    // Broadcast base from lane 15 to all lanes of this block
-    gs_base[blk] = base;
+    // Only lane 15 publishes. Every lane writing here raced the real base back to 0.
+    if (local_block_index == 15u) gs_base[blk] = base;
     GroupMemoryBarrierWithGroupSync();  // B3
 
     base = gs_base[blk];
 
-    // Exclusive scan of plane_bytes and sign_bits over the 16 lanes
+    // Exclusive scan of plane bytes over the 16 lanes.
     uint exclusive_plane = 0u;
     for (uint jj = 0u; jj < local_block_index; jj++) {
         exclusive_plane += gs_plane_bytes[blk * 16u + jj];
     }
-
-    uint exclusive_sign = 0u;
-    for (uint kk = 0u; kk < local_block_index; kk++) {
-        exclusive_sign += gs_sign_bits[blk * 16u + kk];
-    }
-
-    // Total sign bits for this block
-    uint total_sign_bits = 0u;
-    for (uint ll = 0u; ll < 16u; ll++) {
-        total_sign_bits += gs_sign_bits[blk * 16u + ll];
-    }
-    uint total_sign_bytes = (total_sign_bits + 7u) / 8u;
 
     // Total plane bytes for this block
     uint total_plane_bytes = 0u;
@@ -277,10 +277,6 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint g
 
     // Total active blocks (popcount of ballot)
     uint N = countbits(gs_ballot[blk]);
-
-    // Offsets
-    uint plane_off = 4u * base + 3u * N + 8u + exclusive_plane;
-    uint sign_off = 4u * base + 3u * N + 8u + total_plane_bytes;
 
     // ------------------------------------------------------------------
     // P3: Header words, code word, q byte, planes and signs into gs_pkt
@@ -295,104 +291,99 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint g
         int block_index = block_offset_32x32 + block_stride_32x32 * block32x32_y + block32x32_x;
         gs_pkt[blk * MAX_PACKET_WORDS + 1] = modify_quant_code(quant_resolution_code, quant) | (uint(block_index) << 8);
 
-        // Write meta to u1
-        uint meta_offset_addr = 8u + uint(block_index) * 8u;
-        u1.Store(int(meta_offset_addr), int(base));
-        u1.Store(int(meta_offset_addr + 4), int(total_words));
+        // A block we cannot stage must not be advertised. A zero hole desyncs the decoder.
+        if (total_words <= uint(MAX_PACKET_WORDS)) {
+            uint meta_offset_addr = uint(block_index) * 8u;
+            u1.Store(int(meta_offset_addr), int(base));
+            u1.Store(int(meta_offset_addr + 4), int(total_words));
+        }
     }
 
-    // Write code word, q byte, planes, and signs into gs_pkt
-    if (active) {
-        // Header offset within packet (position of this 8x8 block's data)
+    // Code words, quant bytes, and magnitude planes are packet-local.
+    // 4*base is the global address; adding it here wrote later blocks off the end of gs_pkt.
+    uint local_sign_bits = 0u;
+    if (active && total_words != 0u && total_words <= uint(MAX_PACKET_WORDS)) {
         uint hdr_offset = countbits(gs_ballot[blk] & ((1u << local_block_index) - 1u));
 
-        // Write code word (u16) at 4*base + 8 + 2*hdr_offset
-        uint cw_addr = 4u * base + 8u + 2u * hdr_offset;
-        uint cw_low = code_word & 0xffffu;
-        uint word_idx = cw_addr >> 2u;
-        uint byte_offset = cw_addr & 3u;
-        uint existing = gs_pkt[blk * MAX_PACKET_WORDS + word_idx];
-        existing = (existing & ~(0xffffu << (byte_offset * 8u))) | (cw_low << (byte_offset * 8u));
-        gs_pkt[blk * MAX_PACKET_WORDS + word_idx] = existing;
+        uint cw_byte = 8u + 2u * hdr_offset;
+        pkt_put_byte(blk, cw_byte, code_word & 0xffu);
+        pkt_put_byte(blk, cw_byte + 1u, (code_word >> 8u) & 0xffu);
 
-        // Write q byte (u8) at 4*base + 8 + 2*N + hdr_offset
-        uint q_byte_addr = 4u * base + 8u + 2u * N + hdr_offset;
-        uint q_byte = (code_word >> 16u) & 0xffu;
-        uint word_idx2 = q_byte_addr >> 2u;
-        uint byte_offset2 = q_byte_addr & 3u;
-        uint existing2 = gs_pkt[blk * MAX_PACKET_WORDS + word_idx2];
-        existing2 = (existing2 & ~(0xffu << (byte_offset2 * 8u))) | (uint(q_byte) << (byte_offset2 * 8u));
-        gs_pkt[blk * MAX_PACKET_WORDS + word_idx2] = existing2;
+        uint q_byte_addr = 8u + 2u * N + hdr_offset;
+        pkt_put_byte(blk, q_byte_addr, (code_word >> 16u) & 0xffu);
 
-        // Copy planes and extract significant masks for sign bits
-        // meta_cw is the ORIGINAL code word (before quantization) for in_planes
-        uint meta_cw = t0.Load((block_offset_8x8 + block_stride_8x8 * block8x8_y + block8x8_x) * 8);
+        // Only load of the payload offset. It stays in this block, before the
+        // next barrier, and is not loaded anywhere earlier in the shader.
+        uint meta_addr = uint(block_offset_8x8 + block_stride_8x8 * block8x8_y + block8x8_x) * 8u;
+        uint meta_cw = t0.Load(int(meta_addr));
         uint in_q_bits = (meta_cw >> Q_PLANES_OFFSET) & 0xfu;
         uint out_q_bits = (code_word >> Q_PLANES_OFFSET) & 0xfu;
-
-        uint in_offset = meta_offset;
-        uint out_offset = plane_off;
-        uint sign_off_bits = sign_off * 8u + exclusive_sign;  // bit offset within sign region
+        uint in_offset = t0.Load(int(meta_addr + 4u));
+        uint out_offset = 8u + 3u * N + exclusive_plane;
 
         for (int sb = 0; sb < 16; sb += 2) {
-            uint out_planes = ((code_word >> sb) & 3u) + out_q_bits;
-            uint in_planes = ((meta_cw >> sb) & 3u) + in_q_bits;
+            uint out_planes = ((code_word >> uint(sb)) & 3u) + out_q_bits;
+            uint in_planes = ((meta_cw >> uint(sb)) & 3u) + in_q_bits;
             if (in_planes != 0u) in_planes++;
 
-            if (in_planes != 0u && in_offset + in_planes * 4u < 65536u) {
-                // Copy plane bytes and track significant mask
+            if (in_planes != 0u) {
+                uint sign_plane = load_payload_byte(u2, in_offset);
                 uint significant_mask = 0u;
-
-                for (uint p = 0u; p < out_planes && p < in_planes; p++) {
-                    uint byte_idx = in_offset + p;
-                    uint src_word = load_payload_byte(u2, byte_idx);
-                    uint byte_val = (src_word >> (8u * ((byte_idx + 8u) & 3u))) & 0xffu;
-
-                    // Store in packet staging
-                    uint dst_word_idx = out_offset >> 2u;
-                    uint dst_byte_in = out_offset & 3u;
-                    uint existing_pkt = gs_pkt[blk * MAX_PACKET_WORDS + dst_word_idx];
-                    existing_pkt = (existing_pkt & ~(0xffu << (dst_byte_in * 8u))) | (byte_val << (dst_byte_in * 8u));
-                    gs_pkt[blk * MAX_PACKET_WORDS + dst_word_idx] = existing_pkt;
-
-                    // Track significance: if any bit set, this byte is significant
+                for (uint p = 0u; p < out_planes; p++) {
+                    uint byte_val = load_payload_byte(u2, in_offset + 1u + p);
                     significant_mask |= byte_val;
-                    out_offset++;
+                    pkt_put_byte(blk, out_offset + p, byte_val);
                 }
+                out_offset += out_planes;
 
-                // Write sign bits for each set bit in significant_mask
-                // Each set bit k means coefficient k is significant
                 uint sig_mask = significant_mask;
                 while (sig_mask != 0u) {
-                    int bit_pos = firstbitlow(sig_mask);
-                    sig_mask &= sig_mask - 1u;  // Clear lowest set bit
-
-                    // Write sign bit at sign_off_bits + bit_pos
-                    uint sign_word_idx = (sign_off_bits + uint(bit_pos)) >> 5u;  // 32 bits per word
-                    uint sign_bit_in_word = (sign_off_bits + uint(bit_pos)) & 31u;
-
-                    // Read current word from staging
-                    uint pkt_word_idx = sign_word_idx >> 2u;
-                    uint pkt_byte_in = sign_word_idx & 3u;
-                    uint existing_sign = gs_pkt[blk * MAX_PACKET_WORDS + pkt_word_idx];
-
-                    // Set the bit
-                    existing_sign |= (1u << sign_bit_in_word);
-                    gs_pkt[blk * MAX_PACKET_WORDS + pkt_word_idx] = existing_sign;
+                    uint coef = uint(firstbitlow(sig_mask));
+                    sig_mask &= sig_mask - 1u;
+                    uint sign_bit = (sign_plane >> coef) & 1u;
+                    uint sword = (local_block_index << 1) + (local_sign_bits >> 5u);
+                    uint sshift = local_sign_bits & 31u;
+                    if (sword < 32u) InterlockedOr(gs_sign[blk][sword], sign_bit << sshift);
+                    local_sign_bits++;
                 }
             }
 
             in_offset += in_planes;
         }
     }
+    gs_sign_bits[gi] = local_sign_bits;
 
     GroupMemoryBarrierWithGroupSync();  // B4
 
-    // ------------------------------------------------------------------
-    // P4: Copy-out of words words per block to u0
-    // ------------------------------------------------------------------
-    // Each thread copies 16 words (stride 16 within the block)
-    if (total_words != 0u && total_words <= uint(MAX_PACKET_WORDS)) {
+    // Tight sign bits, lane order, immediately after the magnitude planes.
+    // Extra packet words past this are the unused per-coefficient reserve.
+    if (in_range_32x32 && total_words != 0u && total_words <= uint(MAX_PACKET_WORDS) && local_block_index == 0u) {
+        uint sign_base = 8u + 3u * N + total_plane_bytes;
+        uint acc = 0u;
+        uint nacc = 0u;
+        uint out_i = 0u;
+        for (uint lane = 0u; lane < 16u; lane++) {
+            uint nbits = gs_sign_bits[blk * 16u + lane];
+            uint base_word = lane << 1;
+            for (uint b = 0u; b < nbits; b++) {
+                uint src = gs_sign[blk][base_word + (b >> 5u)];
+                uint bit = (src >> (b & 31u)) & 1u;
+                acc |= bit << nacc;
+                nacc++;
+                if (nacc == 8u) {
+                    pkt_put_byte(blk, sign_base + out_i, acc);
+                    out_i++;
+                    acc = 0u;
+                    nacc = 0u;
+                }
+            }
+        }
+        if (nacc != 0u) pkt_put_byte(blk, sign_base + out_i, acc);
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if (in_range_32x32 && total_words != 0u && total_words <= uint(MAX_PACKET_WORDS)) {
         for (uint w = local_block_index; w < total_words; w += 16u) {
             u0.Store(int(4 * (base + w)), gs_pkt[blk * MAX_PACKET_WORDS + w]);
         }
