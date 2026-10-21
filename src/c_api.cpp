@@ -21,6 +21,8 @@ using Microsoft::WRL::ComPtr;
 // Forward declarations (defined in frame.cpp)
 pwd3d11_result pwd3d11_encoder_create(const pwd3d11_encoder_create_info *, pwd3d11_encoder *out);
 pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder, const pwd3d11_cpu_buffer *, const pwd3d11_rate_control *);
+pwd3d11_result pwd3d11_encoder_submit(pwd3d11_encoder, const pwd3d11_cpu_buffer *, const pwd3d11_rate_control *);
+pwd3d11_result pwd3d11_encoder_finish(pwd3d11_encoder);
 pwd3d11_result pwd3d11_encoder_compute_num_packets(pwd3d11_encoder, size_t, size_t *);
 pwd3d11_result pwd3d11_encoder_packetize(pwd3d11_encoder, pwd3d11_packet *, size_t, size_t *, void *, size_t);
 void pwd3d11_encoder_destroy(pwd3d11_encoder);

@@ -98,3 +98,19 @@ Lavapipe output size matches across the two CPUs (172,740 and 388,720 bytes) and
 CPU samples on the GPU paths often read 0. `GetProcessTimes` does not advance while the thread is waiting on the GPU, and a 50 ms slice can fall between the short bursts of submit and map. The average over the run is the figure to use. Lavapipe's CPU standard deviation is large because the 50 ms slices swing from a few threads to most of the chip.
 
 D3D11 working set on the HD 6670 was 26 MiB at 720p and 31 MiB at 1080p. Lavapipe was about 95 to 116 MiB. Vulkan on the RTX was about 198 to 204 MiB.
+
+## 2026-10-21, 4 bit-per-pixel
+
+A later DLL on the same HD 6670 is 358,400 bytes. It encodes at the 4 bit-per-pixel budget, 460,800 bytes at 1280×720. Warm `encode_cpu` is the mean of 8 calls after 8 warmup frames. The first frame in a process compiles the shaders and is not in these times.
+
+| Pattern | ms | Record |
+| --- | ---: | --- |
+| Gradient | 10.4 | 45,412 bytes, 1 packet |
+| Mild | 12.1 | 150,720 bytes, 3 packets |
+| Desktop | 15.4 | 289,280 bytes, 5 packets |
+| Edges | 15.5 | 272,244 bytes, 5 packets |
+| Noise | 24.0 | does not fit |
+
+After warmup, a desktop frame spends about 0.6 ms uploading, 3.8 ms in the wavelet, 1.5 ms quantising, and 8.9 ms packing. The gradient pack is about 4.3 ms.
+
+`libpyrowave-shared` 1.0.0 decoded the four records that fit. A live 1280×720 desktop asked for 60 fps and held about 44–48 fps, near 45 Mbit/s. The 98 fps figure in the 2026-10-20 table is encode-only on the smaller quant-0 bitstream. It is not this live rate.

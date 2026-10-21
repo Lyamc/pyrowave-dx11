@@ -27,11 +27,12 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 function(precompile_shader name src_file)
     set(SRC "${SHADER_DIR}/${src_file}")
     set(Hdr "${SHADER_OUT}/${name}_dxbc.h")
+    set(extra ${ARGN})
 
     add_custom_command(
         OUTPUT "${Hdr}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUT}"
-        COMMAND fxc /nologo /T cs_5_0 /E main /O3 /Ges /Gis
+        COMMAND fxc /nologo /T cs_5_0 /E main /O3 /Ges /Gis ${extra}
                 /Fh "${Hdr}" /Vn g_${name}_dxbc "${SRC}"
         COMMAND "${Python3_EXECUTABLE}"
                 "${EMBED_SCRIPT}" "${Hdr}" "g_${name}_dxbc"
@@ -43,15 +44,21 @@ function(precompile_shader name src_file)
     set(${name}_Hdr "${Hdr}" PARENT_SCOPE)
 endfunction()
 
-precompile_shader(dwt dwt.hlsl)
+precompile_shader(dwt_byte dwt.hlsl /D DWT_FLOAT=0 /D DWT_INTERIOR=0)
+precompile_shader(dwt_float dwt.hlsl /D DWT_FLOAT=1 /D DWT_INTERIOR=0)
+precompile_shader(dwt_ibyte dwt.hlsl /D DWT_FLOAT=0 /D DWT_INTERIOR=1)
+precompile_shader(dwt_ifloat dwt.hlsl /D DWT_FLOAT=1 /D DWT_INTERIOR=1)
 precompile_shader(probe probe.hlsl)
 precompile_shader(quant quant.hlsl)
 precompile_shader(analyze analyze.hlsl)
 precompile_shader(analyze_finalize analyze_finalize.hlsl)
 precompile_shader(resolve resolve.hlsl)
 precompile_shader(pack pack.hlsl)
+precompile_shader(clamp clamp.hlsl)
 
-add_custom_target(shaders ALL DEPENDS "${dwt_Hdr}" "${probe_Hdr}")
+add_custom_target(shaders ALL DEPENDS
+    "${dwt_byte_Hdr}" "${dwt_float_Hdr}" "${dwt_ibyte_Hdr}" "${dwt_ifloat_Hdr}"
+    "${probe_Hdr}" "${clamp_Hdr}")
 
 # ------------------------------------------------------------------
 # Library: pyrowave_d3d11.dll
@@ -65,13 +72,17 @@ add_library(pyrowave_d3d11 SHARED
     quant.cpp
     analyze.cpp
     resolve.cpp
-    ${dwt_Hdr}
+    ${dwt_byte_Hdr}
+    ${dwt_float_Hdr}
+    ${dwt_ibyte_Hdr}
+    ${dwt_ifloat_Hdr}
     ${probe_Hdr}
     ${quant_Hdr}
     ${analyze_Hdr}
     ${analyze_finalize_Hdr}
     ${resolve_Hdr}
     ${pack_Hdr}
+    ${clamp_Hdr}
 )
 target_include_directories(pyrowave_d3d11 PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -98,13 +109,17 @@ add_library(pyrowave_d3d11_static STATIC
     quant.cpp
     analyze.cpp
     resolve.cpp
-    ${dwt_Hdr}
+    ${dwt_byte_Hdr}
+    ${dwt_float_Hdr}
+    ${dwt_ibyte_Hdr}
+    ${dwt_ifloat_Hdr}
     ${probe_Hdr}
     ${quant_Hdr}
     ${analyze_Hdr}
     ${analyze_finalize_Hdr}
     ${resolve_Hdr}
     ${pack_Hdr}
+    ${clamp_Hdr}
 )
 target_include_directories(pyrowave_d3d11_static PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"

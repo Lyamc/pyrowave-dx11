@@ -83,14 +83,9 @@ pwd3d11_result resolve_run(ResolveState *st,
     pc.target_payload_size = target_payload_size;
     pc.num_blocks_per_subdivision = (unsigned int)st->per_sub;
 
-    // Create cbuffer
-    ComPtr<ID3D11Buffer> cb;
-    D3D11_BUFFER_DESC bd = {};
-    bd.ByteWidth = sizeof(ResolvePushConstants);
-    bd.Usage = D3D11_USAGE_IMMUTABLE;
-    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    D3D11_SUBRESOURCE_DATA sd = { &pc, 0, 0 };
-    HRESULT hr = st->device->CreateBuffer(&bd, &sd, &cb);
+    ID3D11Buffer *cb = nullptr;
+    HRESULT hr = pwd3d11_cached_cb(st->device.Get(), st->push_cbs, 0,
+                                   &pc, sizeof(pc), &cb);
     if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
 
     // Bind resources:
@@ -99,10 +94,10 @@ pwd3d11_result resolve_run(ResolveState *st,
     ID3D11ShaderResourceView *srvs[1] = { srv_bucket };
     ID3D11UnorderedAccessView *uavs[1] = { uav_quant };
     ctx->CSSetShader(cs, nullptr, 0);
-    ctx->CSSetConstantBuffers(0, 1, cb.GetAddressOf());
+    ctx->CSSetConstantBuffers(0, 1, &cb);
     ctx->CSSetShaderResources(0, 1, srvs);
     ctx->CSSetUnorderedAccessViews(1, 1, uavs, nullptr);
-    ctx->Dispatch(NUM_BUCKETS, 1, 1);
+    ctx->Dispatch(NUM_BUCKETS * 16, 1, 1);
 
     // Clear bindings
     ID3D11ShaderResourceView *nullsrv = nullptr;
@@ -110,7 +105,6 @@ pwd3d11_result resolve_run(ResolveState *st,
     ctx->CSSetShaderResources(0, 1, &nullsrv);
     ctx->CSSetUnorderedAccessViews(1, 1, &nulluav, nullptr);
 
-    ctx->Flush();
     return PWD3D11_SUCCESS;
 }
 

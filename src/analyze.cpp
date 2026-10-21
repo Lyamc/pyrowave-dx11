@@ -63,15 +63,20 @@ pwd3d11_result analyze_set_stats(AnalyzeState *st, ID3D11Buffer *stats_buffer,
 {
     if (!stats_buffer || !st || count_8x8 <= 0 || count_32x32 <= 0) return PWD3D11_ERROR_INVALID_ARGUMENT;
 
+    if (st->srv_stats && st->stats_buf.Get() == stats_buffer
+        && st->stats_8x8 == count_8x8 && st->total_blocks_32x32 == count_32x32) {
+        return PWD3D11_SUCCESS;
+    }
     st->stats_buf = stats_buffer;
     st->total_blocks_32x32 = count_32x32;
+    st->stats_8x8 = count_8x8;
 
     D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
     sd.Format = DXGI_FORMAT_R32_UINT;
     sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
-    sd.Buffer.NumElements = UINT(count_8x8 * 16); // 64 bytes = 16 uints per 8x8 block
-
-    HRESULT hr = st->device->CreateShaderResourceView(stats_buffer, &sd, &st->srv_stats);
+    sd.Buffer.NumElements = UINT(count_8x8 * 16);
+    HRESULT hr = st->device->CreateShaderResourceView(stats_buffer, &sd,
+                                                      st->srv_stats.ReleaseAndGetAddressOf());
     return SUCCEEDED(hr) ? PWD3D11_SUCCESS : PWD3D11_ERROR_GENERIC;
 }
 
@@ -81,35 +86,46 @@ pwd3d11_result analyze_set_stats(AnalyzeState *st, ID3D11Buffer *stats_buffer,
 pwd3d11_result analyze_create_buffers(AnalyzeState *st)
 {
     if (!st->device) return PWD3D11_ERROR_INVALID_ARGUMENT;
+    st->cb_cursor = 0;
 
-    // per_sub = next_pow2(align(block_count_32x32, 16) / 16)
+    // per_sub = next_pow2(align(block_count_32x32, 16) / 16) — round UP
     int aligned_blocks = (st->total_blocks_32x32 + 15) & ~15;
     int per_sub = aligned_blocks / 16;
-    // Round per_sub to next power of 2
-    while (per_sub & (per_sub - 1)) per_sub &= per_sub - 1;
     if (per_sub < 1) per_sub = 1;
+    int pow2 = 1;
+    while (pow2 < per_sub) {
+        if (pow2 > 0x3fffffff) break;
+        pow2 <<= 1;
+    }
+    per_sub = pow2;
+    st->per_sub = per_sub;
 
     // Bucket buffer size: 64 + 128*16*4 + 128 * per_sub * 16 * 8
     size_t bucket_size = 64ull + 128ull * 16ull * 4ull + 128ull * size_t(per_sub) * 16ull * 8ull;
+    if (st->bucket_buf && st->quant_buf && st->uav_quant
+        && st->bucket_size == bucket_size && st->quant_blocks == st->total_blocks_32x32) {
+        return PWD3D11_SUCCESS;
+    }
     st->bucket_size = bucket_size;
+    st->quant_blocks = st->total_blocks_32x32;
+    st->quant_zero = false;
 
     // Create buffer
     D3D11_BUFFER_DESC bd = {};
     bd.ByteWidth = UINT(bucket_size);
     bd.Usage = D3D11_USAGE_DEFAULT;
-    // Resolve binds this buffer as a shader resource.
     bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+    bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
 
     HRESULT hr = st->device->CreateBuffer(&bd, nullptr, &st->bucket_buf);
     if (FAILED(hr)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
 
-    // Create UAV
-    D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
-    ud.Format = DXGI_FORMAT_R32_UINT;
-    ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-    ud.Buffer.NumElements = UINT(bucket_size / 4);
+    hr = pwd3d11_create_raw_uav(st->device.Get(), st->bucket_buf.Get(), UINT(bucket_size),
+                                st->uav_bucket.ReleaseAndGetAddressOf());
+    if (FAILED(hr)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
 
-    hr = st->device->CreateUnorderedAccessView(st->bucket_buf.Get(), &ud, &st->uav_bucket);
+    hr = pwd3d11_create_raw_srv(st->device.Get(), st->bucket_buf.Get(), UINT(bucket_size),
+                                st->srv_bucket.ReleaseAndGetAddressOf());
     if (FAILED(hr)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
 
     // Create quant data buffer (one int per 32x32 block)
@@ -118,16 +134,14 @@ pwd3d11_result analyze_create_buffers(AnalyzeState *st)
     bd_quant.Usage = D3D11_USAGE_DEFAULT;
     // Pack binds this buffer as a shader resource.
     bd_quant.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+    bd_quant.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
 
     hr = st->device->CreateBuffer(&bd_quant, nullptr, &st->quant_buf);
     if (FAILED(hr)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
 
-    D3D11_UNORDERED_ACCESS_VIEW_DESC ud_quant = {};
-    ud_quant.Format = DXGI_FORMAT_R32_SINT;
-    ud_quant.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-    ud_quant.Buffer.NumElements = st->total_blocks_32x32;
-
-    hr = st->device->CreateUnorderedAccessView(st->quant_buf.Get(), &ud_quant, &st->uav_quant);
+    hr = pwd3d11_create_raw_uav(st->device.Get(), st->quant_buf.Get(),
+                                UINT(st->total_blocks_32x32) * 4u,
+                                st->uav_quant.ReleaseAndGetAddressOf());
     if (FAILED(hr)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
 
     return PWD3D11_SUCCESS;
@@ -177,11 +191,7 @@ pwd3d11_result analyze_run(AnalyzeState *st,
     int bw_32 = (bw + 31) / 32;
     int bh_32 = (bh + 31) / 32;
 
-    // Compute per_sub and num_blocks_aligned
-    int aligned_blocks = (st->total_blocks_32x32 + 15) & ~15;
-    int per_sub = aligned_blocks / 16;
-    while (per_sub & (per_sub - 1)) per_sub &= per_sub - 1;
-    if (per_sub < 1) per_sub = 1;
+    int per_sub = st->per_sub > 0 ? st->per_sub : 1;
     unsigned int num_blocks_aligned = unsigned int(per_sub) * 16u;
     unsigned int block_index_shamt = 0;
     while ((1u << block_index_shamt) < unsigned int(per_sub)) block_index_shamt++;
@@ -195,24 +205,19 @@ pwd3d11_result analyze_run(AnalyzeState *st,
     pc.block_stride_8x8 = block_stride_8x8;
     pc.block_offset_32x32 = block_offset_32x32;
     pc.block_stride_32x32 = block_stride_32x32;
-    pc.total_wg_count = unsigned int(bw_32 * bh_32);
+    pc.total_wg_count = unsigned int(st->total_blocks_32x32);
     pc.num_blocks_aligned = num_blocks_aligned;
     pc.block_index_shamt = block_index_shamt;
 
-    // Create cbuffer
-    ComPtr<ID3D11Buffer> cb;
-    D3D11_BUFFER_DESC bd = {};
-    bd.ByteWidth = sizeof(AnalyzePushConstants);
-    bd.Usage = D3D11_USAGE_IMMUTABLE;
-    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    D3D11_SUBRESOURCE_DATA sd = { &pc, 0, 0 };
-    HRESULT hr = st->device->CreateBuffer(&bd, &sd, &cb);
+    ID3D11Buffer *cb = nullptr;
+    HRESULT hr = pwd3d11_cached_cb(st->device.Get(), st->push_cbs, st->cb_cursor++,
+                                   &pc, sizeof(pc), &cb);
     if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
 
     ID3D11UnorderedAccessView *uavs[1] = { st->uav_bucket.Get() };
     ctx->CSSetShader(cs, nullptr, 0);
-    ctx->CSSetConstantBuffers(0, 1, cb.GetAddressOf());
-    ctx->CSSetShaderResources(0, 1, &st->srv_stats);
+    ctx->CSSetConstantBuffers(0, 1, &cb);
+    ctx->CSSetShaderResources(0, 1, st->srv_stats.GetAddressOf());
     ctx->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
     ctx->Dispatch(bw_32, bh_32, 1);
 
@@ -238,12 +243,11 @@ pwd3d11_result analyze_finalize_run(AnalyzeState *st)
     ID3D11UnorderedAccessView *uavs[1] = { st->uav_bucket.Get() };
     ctx->CSSetShader(cs, nullptr, 0);
     ctx->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
-    ctx->Dispatch(512, 1, 1);
+    ctx->Dispatch(1, 1, 1);
 
     ID3D11UnorderedAccessView *nulluav = nullptr;
     ctx->CSSetUnorderedAccessViews(0, 1, &nulluav, nullptr);
 
-    ctx->Flush();
     return PWD3D11_SUCCESS;
 }
 

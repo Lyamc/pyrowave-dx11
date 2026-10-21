@@ -18,7 +18,10 @@
 
 #include "pyrowave_d3d11.h"
 #include "stage_internal.h"
-#include "shaders/dwt_dxbc.h"
+#include "shaders/dwt_byte_dxbc.h"
+#include "shaders/dwt_float_dxbc.h"
+#include "shaders/dwt_ibyte_dxbc.h"
+#include "shaders/dwt_ifloat_dxbc.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -80,8 +83,8 @@ struct PushConstants {
     uint32_t coeff_pitch;
     uint32_t src_pitch;
     uint32_t src_float;
-    uint32_t _pad0;
-    uint32_t _pad1;
+    uint32_t group_x;
+    uint32_t group_y;
 };
 static_assert(sizeof(PushConstants) == 64, "PushConstants must be 64 bytes");
 
@@ -302,10 +305,9 @@ static RefBands ref_level(const RefPlane &src, int Aw, int Ah, bool dc, bool emu
 // ------------------------------------------------------------------
 // Create the DWT compute shader from embedded bytecode
 // ------------------------------------------------------------------
-static HRESULT create_dwt_shader(ID3D11Device *dev, ID3D11ComputeShader **out)
+static HRESULT create_one_shader(ID3D11Device *dev, const BYTE *code, size_t len, ID3D11ComputeShader **out)
 {
-    // Fallback: use the embedded bytecode directly
-    return dev->CreateComputeShader(g_dwt_dxbc, g_dwt_dxbc_len, nullptr, out);
+    return dev->CreateComputeShader(code, len, nullptr, out);
 }
 
 // ------------------------------------------------------------------
@@ -339,7 +341,13 @@ pwd3d11_result dwt_compile_shader(DWTState *st)
 {
     if (!st->device) return PWD3D11_ERROR_INVALID_ARGUMENT;
     if (st->shader) return PWD3D11_SUCCESS;
-    HRESULT hr = create_dwt_shader(st->device.Get(), st->shader.GetAddressOf());
+    HRESULT hr = create_one_shader(st->device.Get(), g_dwt_byte_dxbc, g_dwt_byte_dxbc_len, st->shader.GetAddressOf());
+    if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
+    hr = create_one_shader(st->device.Get(), g_dwt_float_dxbc, g_dwt_float_dxbc_len, st->shader_float.GetAddressOf());
+    if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
+    hr = create_one_shader(st->device.Get(), g_dwt_ibyte_dxbc, g_dwt_ibyte_dxbc_len, st->shader_interior_byte.GetAddressOf());
+    if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
+    hr = create_one_shader(st->device.Get(), g_dwt_ifloat_dxbc, g_dwt_ifloat_dxbc_len, st->shader_interior_float.GetAddressOf());
     return SUCCEEDED(hr) ? PWD3D11_SUCCESS : PWD3D11_ERROR_GENERIC;
 }
 
@@ -352,70 +360,90 @@ pwd3d11_result dwt_upload_planes(DWTState *st, const pwd3d11_cpu_buffer *buf)
 
     st->pw[0] = buf->width;
     st->ph[0] = buf->height;
-    st->pw[1] = buf->width / 2;
-    st->ph[1] = buf->height / 2;
-    st->pw[2] = buf->width / 2;
-    st->ph[2] = buf->height / 2;
+    if (st->chroma != 0) {
+        st->pw[1] = buf->width;
+        st->ph[1] = buf->height;
+        st->pw[2] = buf->width;
+        st->ph[2] = buf->height;
+    } else {
+        st->pw[1] = buf->width / 2;
+        st->ph[1] = buf->height / 2;
+        st->pw[2] = buf->width / 2;
+        st->ph[2] = buf->height / 2;
+    }
+    const bool tenbit = buf->format == PWD3D11_CPU_BUFFER_FORMAT_YUV420P10
+        || buf->format == PWD3D11_CPU_BUFFER_FORMAT_YUV444P10;
+    const bool sixteen = buf->format == PWD3D11_CPU_BUFFER_FORMAT_YUV420P16
+        || buf->format == PWD3D11_CPU_BUFFER_FORMAT_YUV444P16;
+    st->plane_float = (tenbit || sixteen) ? 1u : 0u;
 
     st->aw = (buf->width + 31) & ~31;
     st->ah = (buf->height + 31) & ~31;
     if (st->aw < 128) st->aw = 128;
     if (st->ah < 128) st->ah = 128;
 
-    // Create plane textures and upload data
+    pwd3d11_unbind_cs(st->context.Get());
+
+    // DWT reads plane_raw, not the unused R8 textures. Keep a DEFAULT raw
+    // buffer and UpdateSubresource after unbind so later frames do not
+    // allocate.
     for (int c = 0; c < 3; c++) {
-        D3D11_TEXTURE2D_DESC td = {};
-        td.Width = st->pw[c]; td.Height = st->ph[c];
-        td.MipLevels = 1; td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_R8_UNORM;
-        td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-        D3D11_SUBRESOURCE_DATA sd = {};
-        sd.pSysMem = buf->data[c];
-        sd.SysMemPitch = static_cast<UINT>(buf->row_stride_in_bytes[c]);
-
-        HRESULT hr = st->device->CreateTexture2D(&td, &sd, &st->planes[c]);
-        if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
-
-        // Create SRV as Texture2DArray with ArraySize=1
-        D3D11_SHADER_RESOURCE_VIEW_DESC sd_desc = {};
-        sd_desc.Format = DXGI_FORMAT_R8_UNORM;
-        sd_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-        sd_desc.Texture2DArray.MipLevels = 1;
-        sd_desc.Texture2DArray.ArraySize = 1;
-
-        hr = st->device->CreateShaderResourceView(st->planes[c].Get(), &sd_desc, &st->plane_srv[c]);
-        if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
-
         st->plane_pitch[c] = st->pw[c];
-        UINT nbytes = UINT(st->plane_pitch[c] * st->ph[c]);
+        UINT nbytes;
+        if (st->plane_float) {
+            nbytes = UINT(st->pw[c] * st->ph[c] * 4);
+        } else {
+            nbytes = UINT(st->plane_pitch[c] * st->ph[c]);
+        }
         nbytes = (nbytes + 3u) & ~3u;
-        std::vector<uint8_t> packed(nbytes, 0);
+        if (st->plane_pack[c].size() != nbytes)
+            st->plane_pack[c].assign(nbytes, 0);
         const auto *src = static_cast<const uint8_t *>(buf->data[c]);
         int stride = int(buf->row_stride_in_bytes[c]);
-        if (stride <= 0) stride = st->pw[c];
-        for (int y = 0; y < st->ph[c]; y++) {
-            memcpy(packed.data() + size_t(y) * size_t(st->plane_pitch[c]),
-                   src + size_t(y) * size_t(stride), size_t(st->pw[c]));
+        if (stride <= 0) {
+            stride = st->pw[c] * (st->plane_float ? (sixteen || tenbit ? 2 : 4) : 1);
         }
-        D3D11_BUFFER_DESC rbd = {};
-        rbd.ByteWidth = nbytes;
-        rbd.Usage = D3D11_USAGE_IMMUTABLE;
-        rbd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        rbd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
-        D3D11_SUBRESOURCE_DATA rsd = {};
-        rsd.pSysMem = packed.data();
-        hr = st->device->CreateBuffer(&rbd, &rsd, &st->plane_raw[c]);
-        if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
-        D3D11_SHADER_RESOURCE_VIEW_DESC rsv = {};
-        rsv.Format = DXGI_FORMAT_R32_TYPELESS;
-        rsv.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
-        rsv.BufferEx.NumElements = nbytes / 4u;
-        rsv.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
-        hr = st->device->CreateShaderResourceView(st->plane_raw[c].Get(), &rsv, &st->plane_raw_srv[c]);
-        if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
+        for (int y = 0; y < st->ph[c]; y++) {
+            if (!st->plane_float) {
+                memcpy(st->plane_pack[c].data() + size_t(y) * size_t(st->plane_pitch[c]),
+                       src + size_t(y) * size_t(stride), size_t(st->pw[c]));
+                continue;
+            }
+            auto *dst = reinterpret_cast<float *>(
+                st->plane_pack[c].data() + size_t(y) * size_t(st->pw[c]) * 4u);
+            const auto *row = src + size_t(y) * size_t(stride);
+            for (int x = 0; x < st->pw[c]; x++) {
+                uint16_t sample = 0;
+                memcpy(&sample, row + size_t(x) * 2u, 2);
+                float n = sixteen ? float(sample) / 65535.0f
+                                  : float(sample & 0x3ff) / 1023.0f;
+                dst[x] = n - 0.5f;
+            }
+        }
+        if (!st->plane_raw[c] || st->plane_raw_bytes[c] != int(nbytes)) {
+            D3D11_BUFFER_DESC rbd = {};
+            rbd.ByteWidth = nbytes;
+            rbd.Usage = D3D11_USAGE_DEFAULT;
+            rbd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            rbd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+            HRESULT hr = st->device->CreateBuffer(&rbd, nullptr, &st->plane_raw[c]);
+            if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
+            D3D11_SHADER_RESOURCE_VIEW_DESC rsv = {};
+            rsv.Format = DXGI_FORMAT_R32_TYPELESS;
+            rsv.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+            rsv.BufferEx.NumElements = nbytes / 4u;
+            rsv.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+            hr = st->device->CreateShaderResourceView(st->plane_raw[c].Get(), &rsv,
+                                                      st->plane_raw_srv[c].ReleaseAndGetAddressOf());
+            if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
+            st->plane_raw_bytes[c] = int(nbytes);
+        }
+        D3D11_BOX box = {};
+        box.right = nbytes;
+        box.bottom = 1;
+        box.back = 1;
+        st->context->UpdateSubresource(st->plane_raw[c].Get(), 0, &box,
+                                       st->plane_pack[c].data(), nbytes, 0);
     }
 
     return PWD3D11_SUCCESS;
@@ -426,22 +454,25 @@ pwd3d11_result dwt_upload_planes(DWTState *st, const pwd3d11_cpu_buffer *buf)
 // ------------------------------------------------------------------
 pwd3d11_result dwt_create_bands(DWTState *st)
 {
+    pwd3d11_unbind_cs(st->context.Get());
+    const bool reuse = st->bands_ready && st->bands[0][0].tex
+        && st->bands[0][0].w == (st->aw >> 1) && st->bands[0][0].h == (st->ah >> 1);
     for (int c = 0; c < 3; c++) {
-        int start_level = (c == 0 && st->chroma == 0) ? 0 : 1; // chroma starts at level 1 for 4:2:0
+        int start_level = (st->chroma == 0 && c != 0) ? 1 : 0; // 4:2:0 chroma starts at level 1
         for (int l = start_level; l < Levels; l++) {
             int bw = st->aw >> (l + 1);
             int bh = st->ah >> (l + 1);
-            // The shader UAV is RWTexture2DArray<float>, which is R32_FLOAT.
-            // R16_FLOAT on levels 0 and 1 stored the wrong bits on the HD 6670
-            // and the decoder reconstructed those bands as color noise.
-            DXGI_FORMAT fmt = DXGI_FORMAT_R32_FLOAT;
-            st->bands[c][l] = make_band(st->device.Get(), bw, bh, fmt);
-            if (!st->bands[c][l].tex) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
-            float zero[4] = {};
-            st->context->ClearUnorderedAccessViewFloat(st->bands[c][l].uav.Get(), zero);
-            st->context->ClearUnorderedAccessViewFloat(st->bands[c][l].coeff_uav.Get(), zero);
+            if (!reuse) {
+                // The shader UAV is RWTexture2DArray<float>, which is R32_FLOAT.
+                // R16_FLOAT on levels 0 and 1 stored the wrong bits on the HD 6670
+                // and the decoder reconstructed those bands as color noise.
+                DXGI_FORMAT fmt = DXGI_FORMAT_R32_FLOAT;
+                st->bands[c][l] = make_band(st->device.Get(), bw, bh, fmt);
+                if (!st->bands[c][l].tex) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
+            }
         }
     }
+    st->bands_ready = true;
     return PWD3D11_SUCCESS;
 }
 
@@ -453,40 +484,9 @@ pwd3d11_result dwt_run(DWTState *st)
     if (!st || !st->shader) return PWD3D11_ERROR_INVALID_ARGUMENT;
 
     auto ctx = st->context;
-    ID3D11ComputeShader *cs = st->shader.Get();
     ID3D11ShaderResourceView *nullsrv = nullptr;
     ID3D11UnorderedAccessView *nulluav[3] = { nullptr, nullptr, nullptr };
 
-    // Largest grid is luma level 0. Each group holds a 20*64 float2 tile,
-    // and the horizontal pass writes a second slot.
-    const uint32_t tile = 20u * 64u;
-    uint32_t max_gx = (uint32_t(st->aw) + 31u) / 32u;
-    uint32_t max_gy = (uint32_t(st->ah) + 31u) / 32u;
-    uint32_t need_floats = max_gx * max_gy * tile * 2u * 2u;
-    if (!st->scratch_uav || st->scratch_floats < need_floats) {
-        D3D11_BUFFER_DESC sbd = {};
-        sbd.ByteWidth = need_floats * 4u;
-        sbd.Usage = D3D11_USAGE_DEFAULT;
-        sbd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-        ComPtr<ID3D11Buffer> buf;
-        HRESULT hr = st->device->CreateBuffer(&sbd, nullptr, &buf);
-        if (FAILED(hr)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
-        D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
-        ud.Format = DXGI_FORMAT_R32_FLOAT;
-        ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-        ud.Buffer.NumElements = need_floats;
-        ComPtr<ID3D11UnorderedAccessView> uav;
-        hr = st->device->CreateUnorderedAccessView(buf.Get(), &ud, &uav);
-        if (FAILED(hr)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
-        st->scratch = buf;
-        st->scratch_uav = uav;
-        st->scratch_floats = need_floats;
-    }
-
-    ctx->CSSetShader(cs, nullptr, 0);
-
-    // Build dispatch list: level 0 Y, then for each level 1..4 components 0,1,2
-    // Order: 0,Y -> 1,Cb -> 1,Cr -> 1,Y -> 2,Y -> 2,Cb -> 2,Cr -> 3,Y -> 3,Cb -> 3,Cr -> 4,Y -> 4,Cb -> 4,Cr = 13 dispatches
     struct DispatchEntry {
         ID3D11ShaderResourceView *src;
         ID3D11UnorderedAccessView *uav;
@@ -498,44 +498,55 @@ pwd3d11_result dwt_run(DWTState *st)
         uint32_t dc_shift;
         float range_scale;
         UINT gx, gy;
+        UINT ox, oy, dx, dy;
+        bool interior;
     };
 
     std::vector<DispatchEntry> disps;
 
-    // Helper to add a dispatch
     auto add_disp = [&](ID3D11ShaderResourceView *src, uint32_t src_pitch, uint32_t src_float,
                         const BandTex &band, int rx, int ry, int ax, int ay, bool dc, float rs) {
-        DispatchEntry e;
-        e.src = src;
-        e.src_pitch = src_pitch;
-        e.src_float = src_float;
-        e.uav = band.uav.Get();
-        e.coeff = band.coeff_uav.Get();
-        e.coeff_pitch = uint32_t(band.pitch);
-        e.rx = rx; e.ry = ry; e.ax = ax; e.ay = ay;
-        e.dc_shift = dc ? 1u : 0u;
-        e.range_scale = rs;
-        e.gx = UINT((ax + 31) / 32);
-        e.gy = UINT((ay + 31) / 32);
-        disps.push_back(e);
+        auto push = [&](UINT ox, UINT oy, UINT dx, UINT dy, bool interior) {
+            if (dx == 0 || dy == 0) return;
+            DispatchEntry e;
+            e.src = src;
+            e.src_pitch = src_pitch;
+            e.src_float = src_float;
+            e.uav = band.uav.Get();
+            e.coeff = band.coeff_uav.Get();
+            e.coeff_pitch = uint32_t(band.pitch);
+            e.rx = rx; e.ry = ry; e.ax = ax; e.ay = ay;
+            e.dc_shift = dc ? 1u : 0u;
+            e.range_scale = rs;
+            e.gx = UINT((ax + 31) / 32);
+            e.gy = UINT((ay + 31) / 32);
+            e.ox = ox; e.oy = oy; e.dx = dx; e.dy = dy;
+            e.interior = interior;
+            disps.push_back(e);
+        };
+        UINT gx = UINT((ax + 31) / 32);
+        UINT gy = UINT((ay + 31) / 32);
+        // One dispatch per level. Splitting interior groups did not cut 720p
+        // time on the HD 6670 and it slowed 512x288.
+        push(0, 0, gx, gy, false);
     };
 
-    // L0: Y component (dc_shift=1, range_scale from buffer)
-    add_disp(st->plane_raw_srv[0].Get(), uint32_t(st->plane_pitch[0]), 0u, st->bands[0][0],
-             st->pw[0], st->ph[0], st->aw, st->ah, true, 1.0f);
+    add_disp(st->plane_raw_srv[0].Get(), uint32_t(st->plane_pitch[0]), st->plane_float,
+             st->bands[0][0], st->pw[0], st->ph[0], st->aw, st->ah, true, 1.0f);
+    if (st->chroma != 0) {
+        for (int c = 1; c < 3; c++) {
+            add_disp(st->plane_raw_srv[c].Get(), uint32_t(st->plane_pitch[c]), st->plane_float,
+                     st->bands[c][0], st->pw[c], st->ph[c], st->aw, st->ah, true, 1.0f);
+        }
+    }
 
-    // L1..4: for each level, components 0, 1, 2
     for (int l = 1; l < Levels; l++) {
         for (int c = 0; c < 3; c++) {
-            // First entry for this component: chroma at L1 uses plane, others use LL from previous level
             bool is_chroma_l1 = (c > 0 && l == 1 && st->chroma == 0);
-
             if (is_chroma_l1) {
-                // Chroma L1: input is the chroma plane
-                add_disp(st->plane_raw_srv[c].Get(), uint32_t(st->plane_pitch[c]), 0u, st->bands[c][l],
-                         st->pw[c], st->ph[c], st->aw >> 1, st->ah >> 1, true, 1.0f);
+                add_disp(st->plane_raw_srv[c].Get(), uint32_t(st->plane_pitch[c]), st->plane_float,
+                         st->bands[c][l], st->pw[c], st->ph[c], st->aw >> 1, st->ah >> 1, true, 1.0f);
             } else {
-                // Layer 0 of the previous level, from the coefficient buffer.
                 const BandTex &prev = st->bands[c][l - 1];
                 add_disp(prev.coeff_srv.Get(), uint32_t(prev.pitch), 1u, st->bands[c][l],
                          prev.w, prev.h, prev.w, prev.h, false, 1.0f);
@@ -543,14 +554,10 @@ pwd3d11_result dwt_run(DWTState *st)
         }
     }
 
-    // Execute dispatches
+    size_t disp_i = 0;
+    ID3D11ShaderResourceView *bound_src = nullptr;
+    ID3D11UnorderedAccessView *bound_coeff = nullptr;
     for (auto &d : disps) {
-        ComPtr<ID3D11Buffer> cb;
-        D3D11_BUFFER_DESC bd = {};
-        bd.ByteWidth = sizeof(PushConstants);
-        bd.Usage = D3D11_USAGE_IMMUTABLE;
-        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-
         PushConstants pc = {};
         pc.rx = d.rx; pc.ry = d.ry;
         pc.ix = 1.0f / float(d.rx); pc.iy = 1.0f / float(d.ry);
@@ -558,31 +565,47 @@ pwd3d11_result dwt_run(DWTState *st)
         pc.dc = d.dc_shift;
         pc.rs = d.range_scale;
         pc.groups_x = d.gx;
-        pc.slot_stride = d.gx * d.gy * tile;
+        pc.slot_stride = 0;
         pc.coeff_pitch = d.coeff_pitch;
         pc.src_pitch = d.src_pitch;
         pc.src_float = d.src_float;
+        pc.group_x = d.ox;
+        pc.group_y = d.oy;
+        pc.phase = 0;
 
-        ID3D11UnorderedAccessView *uavs[3] = { d.uav, st->scratch_uav.Get(), d.coeff };
-        ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
-        ctx->CSSetShaderResources(0, 1, &d.src);
+        ID3D11ComputeShader *cs = st->shader.Get();
+        if (d.interior)
+            cs = d.src_float ? st->shader_interior_float.Get() : st->shader_interior_byte.Get();
+        else if (d.src_float)
+            cs = st->shader_float.Get();
+        ctx->CSSetShader(cs, nullptr, 0);
 
-        for (uint32_t phase = 0; phase < 4; ++phase) {
-            pc.phase = phase;
-            D3D11_SUBRESOURCE_DATA sd = {};
-            sd.pSysMem = &pc;
-            HRESULT hr = st->device->CreateBuffer(&bd, &sd, &cb);
-            if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
-            ctx->CSSetConstantBuffers(0, 1, cb.GetAddressOf());
-            ctx->Dispatch(d.gx, d.gy, 1);
-            cb.Reset();
+        if (d.src != bound_src || d.coeff != bound_coeff) {
+            ID3D11UnorderedAccessView *uavs[3] = { d.uav, nullptr, d.coeff };
+            ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
+            ctx->CSSetShaderResources(0, 1, &d.src);
+            bound_src = d.src;
+            bound_coeff = d.coeff;
         }
+
+        if (st->level_cb.size() <= disp_i) st->level_cb.resize(disp_i + 1);
+        if (!st->level_cb[disp_i]) {
+            D3D11_BUFFER_DESC cbd = {};
+            cbd.ByteWidth = sizeof(PushConstants);
+            cbd.Usage = D3D11_USAGE_IMMUTABLE;
+            cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            D3D11_SUBRESOURCE_DATA sd = { &pc, 0, 0 };
+            HRESULT hr = st->device->CreateBuffer(&cbd, &sd, &st->level_cb[disp_i]);
+            if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
+        }
+        ctx->CSSetConstantBuffers(0, 1, st->level_cb[disp_i].GetAddressOf());
+        ctx->Dispatch(d.dx, d.dy, 1);
+        disp_i++;
     }
 
     // Clear shader resources
     ctx->CSSetShaderResources(0, 1, &nullsrv);
     ctx->CSSetUnorderedAccessViews(0, 3, nulluav, nullptr);
-    ctx->Flush();
 
     return PWD3D11_SUCCESS;
 }
@@ -596,7 +619,7 @@ static std::vector<std::vector<float>> dwt_readback(DWTState *st)
     result.resize(3 * Levels); // [component * Levels + level]
 
     for (int c = 0; c < 3; c++) {
-        int start_level = (c == 0 && st->chroma == 0) ? 0 : 1;
+        int start_level = (st->chroma == 0 && c != 0) ? 1 : 0;
         for (int l = start_level; l < Levels; l++) {
             for (int b = 0; b < 4; b++) {
                 auto layer = readback_layer(st->bands[c][l], b, st->device.Get());
@@ -628,7 +651,7 @@ static double validate_dwt(DWTState *st, const pwd3d11_cpu_buffer *buf, bool emu
     double worst_error = 0;
 
     for (int c = 0; c < 3; c++) {
-        int start_level = (c == 0 && st->chroma == 0) ? 0 : 1;
+        int start_level = (st->chroma == 0 && c != 0) ? 1 : 0;
         for (int l = start_level; l < Levels; l++) {
             bool is_first = (l == start_level);
             (void)is_first; // rx/ry were used when is_first was checked

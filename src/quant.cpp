@@ -178,6 +178,12 @@ pwd3d11_result quant_create_outputs(QuantState *st)
         int bh = (b.h + 7) / 8;
         total_blocks += bw * bh;
     }
+    size_t payload_size = 136u + size_t(total_blocks) * 256u;
+    payload_size = (payload_size + 15u) & ~size_t(15);
+    if (st->meta_buf && st->stats_buf && st->payload_buf
+        && st->total_blocks == total_blocks && st->payload_size == payload_size) {
+        return PWD3D11_SUCCESS;
+    }
     st->total_blocks = total_blocks;
     if (total_blocks <= 0 || st->total_blocks_32 <= 0) return PWD3D11_ERROR_INVALID_ARGUMENT;
 
@@ -226,8 +232,8 @@ pwd3d11_result quant_create_outputs(QuantState *st)
         if (FAILED(hr)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
     }
 
-    // u2: Payload buffer (AW*AH*2 + padding)
-    st->payload_size = size_t(st->aw) * size_t(st->ah) * 8 + size_t(total_blocks) * 64 + 256;
+    // u2: 8-byte header, 32 stripe bins, then one 256-byte slot per 8x8.
+    st->payload_size = 136u + size_t(total_blocks) * 256u;
     st->payload_size = (st->payload_size + 15u) & ~size_t(15);
 
     {
@@ -235,6 +241,7 @@ pwd3d11_result quant_create_outputs(QuantState *st)
         bd.ByteWidth = UINT(st->payload_size);
         bd.Usage = D3D11_USAGE_DEFAULT;
         bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+        bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
 
         ComPtr<ID3D11Buffer> buf;
         HRESULT hr = st->device->CreateBuffer(&bd, nullptr, &buf);
@@ -248,6 +255,9 @@ pwd3d11_result quant_create_outputs(QuantState *st)
         ud.Buffer.NumElements = UINT(st->payload_size / 4);
 
         hr = st->device->CreateUnorderedAccessView(buf.Get(), &ud, &st->uav_payload);
+        if (FAILED(hr)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
+        hr = pwd3d11_create_raw_srv(st->device.Get(), buf.Get(), UINT(st->payload_size),
+                                    st->srv_payload.ReleaseAndGetAddressOf());
         if (FAILED(hr)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
     }
 
@@ -312,53 +322,93 @@ pwd3d11_result quant_run(QuantState *st)
     ID3D11ShaderResourceView *nullsrv = nullptr;
     ID3D11UnorderedAccessView *nulluav[3] = {nullptr, nullptr, nullptr};
 
+    pwd3d11_unbind_cs(ctx.Get());
     ctx->CSSetShader(cs, nullptr, 0);
+    // Pack and quant only read bytes this dispatch writes. Skip a
+    // multi-megabyte ClearUAV. Bytes 0-7 hold the pack word counter.
+    // Bytes 8-135 are the 32 quant stripe bins (quant.hlsl PAYLOAD_SLOT0).
+    UINT zeros_hdr[34] = {};
+    D3D11_BOX box = {};
+    box.right = sizeof(zeros_hdr);
+    box.bottom = 1;
+    box.back = 1;
+    ctx->UpdateSubresource(st->payload_buf.Get(), 0, &box, zeros_hdr, 0, 0);
     UINT zero[4] = {};
-    ctx->ClearUnorderedAccessViewUint(st->uav_payload.Get(), zero);
     ctx->ClearUnorderedAccessViewUint(st->uav_meta.Get(), zero);
     ctx->ClearUnorderedAccessViewUint(st->uav_stats.Get(), zero);
 
-    for (auto &b : st->bands) {
-        int bw = b.w, bh = b.h;
-        if (bw <= 0 || bh <= 0) continue;
-        int bw_8 = (bw + 7) / 8;
-        int bh_8 = (bh + 7) / 8;
+    ID3D11UnorderedAccessView *uavs[3] = { st->uav_meta.Get(), st->uav_stats.Get(), st->uav_payload.Get() };
+    ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
+
+    struct SubCB {
+        struct { float layer, qres, z, w; } info[4];
+        int off[4];
+    };
+    static_assert(sizeof(SubCB) == 80, "quant subband constant is 80 bytes");
+
+    size_t set_i = 0;
+    for (size_t i = 0; i < st->bands.size(); ) {
+        const auto &b0 = st->bands[i];
+        if (b0.w <= 0 || b0.h <= 0) { i++; continue; }
+        size_t j = i + 1;
+        while (j < st->bands.size() && st->bands[j].srv.Get() == b0.srv.Get()
+               && st->bands[j].w == b0.w && st->bands[j].h == b0.h
+               && st->bands[j].pitch == b0.pitch)
+            j++;
+        UINT nsub = UINT(j - i);
+        if (nsub > 4) return PWD3D11_ERROR_GENERIC;
 
         QuantPushConstants pc = {};
-        pc.resolution_x = bw;
-        pc.resolution_y = bh;
-        pc.resolution_8x8_blocks_x = (bw + 7) / 8;
-        pc.resolution_8x8_blocks_y = (bh + 7) / 8;
-        pc.inv_resolution_x = 1.0f / float(bw);
-        pc.inv_resolution_y = 1.0f / float(bh);
-        pc.input_layer = float(b.band);
-        pc.quant_resolution = get_quant_resolution(b.level, b.component, b.band, st->chroma);
-        pc.block_offset = b.block_offset_8;
-        pc.block_stride = b.block_stride_8;
-        pc.rdo_distortion_scale = get_rdo_distortion_scale(b.level, b.component, b.band, st->chroma);
-        pc.coeff_pitch = uint32_t(b.pitch);
+        pc.resolution_x = b0.w;
+        pc.resolution_y = b0.h;
+        pc.resolution_8x8_blocks_x = (b0.w + 7) / 8;
+        pc.resolution_8x8_blocks_y = (b0.h + 7) / 8;
+        pc.inv_resolution_x = 1.0f / float(b0.w);
+        pc.inv_resolution_y = 1.0f / float(b0.h);
+        pc.block_stride = b0.block_stride_8;
+        pc.rdo_distortion_scale = get_rdo_distortion_scale(b0.level, b0.component, b0.band, st->chroma);
+        pc.coeff_pitch = uint32_t(b0.pitch);
 
-        // Create cbuffer
-        ComPtr<ID3D11Buffer> cb;
-        D3D11_BUFFER_DESC bd = {};
-        bd.ByteWidth = sizeof(QuantPushConstants);
-        bd.Usage = D3D11_USAGE_IMMUTABLE;
-        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        D3D11_SUBRESOURCE_DATA sd = { &pc, 0, 0 };
-        HRESULT hr = st->device->CreateBuffer(&bd, &sd, &cb);
-        if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
+        SubCB sub = {};
+        for (UINT s = 0; s < nsub; s++) {
+            const auto &b = st->bands[i + s];
+            sub.info[s].layer = float(b.band);
+            sub.info[s].qres = get_quant_resolution(b.level, b.component, b.band, st->chroma);
+            sub.off[s] = b.block_offset_8;
+        }
 
-        ctx->CSSetConstantBuffers(0, 1, cb.GetAddressOf());
-        ctx->CSSetShaderResources(0, 1, b.srv.GetAddressOf());
-        ID3D11UnorderedAccessView *uavs[3] = { st->uav_meta.Get(), st->uav_stats.Get(), st->uav_payload.Get() };
-        ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
-
-        ctx->Dispatch(UINT(bw_8), UINT(bh_8), 1);
+        if (st->band_cb.size() <= set_i) st->band_cb.resize(set_i + 1);
+        if (st->sub_cb.size() <= set_i) st->sub_cb.resize(set_i + 1);
+        if (!st->band_cb[set_i]) {
+            D3D11_BUFFER_DESC bd = {};
+            bd.ByteWidth = sizeof(QuantPushConstants);
+            bd.Usage = D3D11_USAGE_IMMUTABLE;
+            bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            D3D11_SUBRESOURCE_DATA sd = { &pc, 0, 0 };
+            HRESULT hr = st->device->CreateBuffer(&bd, &sd, &st->band_cb[set_i]);
+            if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
+        }
+        if (!st->sub_cb[set_i]) {
+            D3D11_BUFFER_DESC bd = {};
+            bd.ByteWidth = sizeof(SubCB);
+            bd.Usage = D3D11_USAGE_IMMUTABLE;
+            bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            D3D11_SUBRESOURCE_DATA sd = { &sub, 0, 0 };
+            HRESULT hr = st->device->CreateBuffer(&bd, &sd, &st->sub_cb[set_i]);
+            if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
+        }
+        ID3D11Buffer *cbs[2] = { st->band_cb[set_i].Get(), st->sub_cb[set_i].Get() };
+        ctx->CSSetConstantBuffers(0, 2, cbs);
+        ctx->CSSetShaderResources(0, 1, b0.srv.GetAddressOf());
+        int bw_8 = (b0.w + 7) / 8;
+        int bh_8 = (b0.h + 7) / 8;
+        ctx->Dispatch(UINT((bw_8 + 7) / 8), UINT(bh_8), nsub);
+        set_i++;
+        i = j;
     }
 
     ctx->CSSetShaderResources(0, 1, &nullsrv);
     ctx->CSSetUnorderedAccessViews(0, 3, nulluav, nullptr);
-    ctx->Flush();
 
     return PWD3D11_SUCCESS;
 }

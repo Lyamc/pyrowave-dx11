@@ -36,26 +36,11 @@ ByteAddressBuffer t0 : register(t0);
 // ------------------------------------------------------------------
 // Groupshared memory
 // ------------------------------------------------------------------
+groupshared uint gs_cost64[64];       // per-thread cost during the 16-lane xor butterfly
+groupshared float gs_dist64[64];      // per-thread distortion during the butterfly
 groupshared uint gs_rate_cost[16];    // rate for each i=0..15
 groupshared float gs_distortion[16];  // distortion for each i=0..15
 groupshared uint gs_scan_val[64];     // Hillis-Steele scan (all 64 threads)
-
-// ------------------------------------------------------------------
-// Helper: f16 bits to f32 (ar: errors buffer layout)
-// ------------------------------------------------------------------
-float f16_to_f32(uint f16_bits)
-{
-    if (f16_bits == 0u) return 0.0f;
-    uint sign = (f16_bits >> 15) & 1u;
-    uint exp = (f16_bits >> 10) & 0x1fu;
-    uint frac = (f16_bits >> 0) & 0x1ffu;
-    if (exp == 0u) {
-        // Subnormal -> zero
-        return asfloat(sign << 31u);
-    }
-    // Normal
-    return asfloat((sign << 31u) | ((exp + 112u) << 23u) | (frac << 13u));
-}
 
 // ------------------------------------------------------------------
 // Helper: distortion to bucket index (ar:73-84)
@@ -79,6 +64,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
     uint lb = gi & 15u; // 0..15, local 8x8 block within 32x32
     uint lx = lb & 3u;
     uint ly = lb >> 2u;
+    uint g = gi >> 4u; // wave 0..3; each owns i = g, g+4, g+8, g+12
 
     // 32x32 block index
     int2 block32x32_idx = int2(int(gid.x), int(gid.y));
@@ -97,85 +83,50 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
         num_planes = t0.Load(stats_base + 0);
     }
 
-    // ------------------------------------------------------------------
-    // Compute rate and distortion for each i=0..15
-    // Each thread handles one i value: thread t handles i=t
-    // We unroll the 4-iteration loop from the GLSL (ar:167-214)
-    // ------------------------------------------------------------------
-    // Threads 0,4,8,12 compute i=0; threads 1,5,9,13 compute i=1; etc.
-    // Then we reduce over the 4 threads for each i.
+    if (gi < 16u) {
+        gs_rate_cost[gi] = 0u;
+        gs_distortion[gi] = 0.0f;
+    }
+    GroupMemoryBarrierWithGroupSync();
 
-    // Per-thread: my_i = gi % 16, my_group = gi / 16
-    // Actually: each thread t computes for i=t, then threads {t, t+16, t+32, t+48} reduce
-    // But we have 64 threads and 16 i-values, so 4 threads per i-value.
-
-    // Simpler: each thread computes its own (dist, cost) for i=gi%16,
-    // then reduces with the 3 other threads handling the same i.
-
-    uint my_i = gi % 16u;
-    uint my_offset = gi / 16u; // 0..3, which of the 4 threads for this i
-
-    float my_dist = 0.0f;
-    uint my_cost = 0u;
-
-    if (in8) {
-        uint err_offset = stats_base + 4u + my_i * 8u;
-        if (my_i < num_planes) {
-            uint e = t0.Load(int(err_offset));
-            my_dist = f16_to_f32(e & 0xffffu);
-            my_cost = e >> 16u;
+    // Spec §4: four waves, i ∈ {g, g+4, g+8, g+12}. Reduce over the 16
+    // lanes of this wave (xor 1,2,4,8). One 16-pass loop on threads 0..15
+    // was 128 barriers and 720p TDRed into empty packets on the HD 6670.
+    [loop]
+    for (uint k = 0u; k < 4u; k++) {
+        uint i = g + k * 4u;
+        float dist = 0.0f;
+        uint cost = 0u;
+        if (in8) {
+            uint ei = min(i, num_planes);
+            uint e = t0.Load(int(stats_base + 4u + ei * 4u));
+            dist = f16tof32(e & 0xffffu);
+            cost = e >> 16u;
         }
+        if (cost != 0u)
+            cost += 24u;
+
+        uint cost_r = cost;
+        float dist_r = dist;
+        [unroll]
+        for (uint s = 1u; s < 16u; s *= 2u) {
+            gs_cost64[gi] = cost_r;
+            gs_dist64[gi] = dist_r;
+            GroupMemoryBarrierWithGroupSync();
+            uint peer = (gi & ~15u) | ((lb ^ s) & 15u);
+            cost_r += gs_cost64[peer];
+            dist_r += gs_dist64[peer];
+            GroupMemoryBarrierWithGroupSync();
+        }
+
+        if (lb == 0u) {
+            if (cost_r != 0u)
+                cost_r += 64u;
+            gs_rate_cost[i] = (cost_r + 31u) >> 5u;
+            gs_distortion[i] = dist_r;
+        }
+        GroupMemoryBarrierWithGroupSync();
     }
-
-    if (my_cost != 0u)
-        my_cost += 24u;
-
-    // Store for reduction
-    gs_rate_cost[lb] = my_cost;
-    gs_distortion[lb] = my_dist;
-
-    // Barrier: all 64 threads have written
-    GroupMemoryBarrierWithGroupSync();
-
-    // ------------------------------------------------------------------
-    // Reduce over 4 threads per i-value (ar:184-214)
-    // XOR butterfly: 1, 2 (only need 2 steps for 4 threads)
-    // Each thread t reduces with t^1, t^2
-    // ------------------------------------------------------------------
-    uint reduce_idx = gi % 16u;
-    uint reduce_base = gi - reduce_idx; // 0, 16, 32, or 48
-
-    uint red_cost = gs_rate_cost[reduce_idx];
-    float red_dist = gs_distortion[reduce_idx];
-
-    // XOR butterfly for 4 threads: steps 1, 2
-    if ((gi & 1u) != 0u) {
-        uint peer = reduce_base; // gi ^ 1
-        red_cost += gs_rate_cost[peer % 16u];
-        red_dist += gs_distortion[peer % 16u];
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    if ((gi & 2u) != 0u) {
-        uint peer = reduce_base + (gi & 1u); // gi ^ 2
-        red_cost += gs_rate_cost[peer % 16u];
-        red_dist += gs_distortion[peer % 16u];
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    // Only thread 0 of each i-group (gi % 16 == 0) writes the result
-    if (reduce_idx == 0u) {
-        // cost += 64 if non-zero (ar:208-209)
-        if (red_cost != 0u)
-            red_cost += 64u;
-
-        // rate = (cost + 31) >> 5 (ar:212)
-        gs_rate_cost[my_i] = (red_cost + 31u) >> 5u;
-        gs_distortion[my_i] = red_dist;
-    }
-
-    // Barrier: all 16 rate/dist values ready
-    GroupMemoryBarrierWithGroupSync();
 
     // ------------------------------------------------------------------
     // Hillis-Steele inclusive max scan (all 64 threads participate)
@@ -212,7 +163,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
     // Emit RDO operations (all 64 threads, but only gi < 16 produce output)
     // ------------------------------------------------------------------
     if (gi < 16u) {
-        uint inclusive_bucket = scan_val;
+        uint inclusive_bucket = min(scan_val, 127u);
 
         // Emit operations (ar:129-147)
         if (gi == 0u) {
@@ -220,8 +171,11 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
             u0.InterlockedAdd(4u, gs_rate_cost[0]);
         }
         else {
-            // saving = rate[gi-1] - rate[gi] (ar:133)
-            uint saving = gs_rate_cost[gi - 1u] - gs_rate_cost[gi];
+            // saving = rate[gi-1] - rate[gi] (ar:133). Unsigned wrap here
+            // poisons the prefix sum and leaves later 32x32 blocks at quant 0.
+            uint r_prev = gs_rate_cost[gi - 1u];
+            uint r_cur = gs_rate_cost[gi];
+            uint saving = (r_prev > r_cur) ? (r_prev - r_cur) : 0u;
 
             if (saving != 0u) {
                 // block_index (ar:136-139)

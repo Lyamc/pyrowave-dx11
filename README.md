@@ -6,9 +6,21 @@ The bitstream matches the Vulkan encoder. A player decodes it with `libpyrowave-
 
 ## Release
 
-Tag **v0.1.1** publishes `pyrowave_d3d11.dll` (x64, MSVC, static CRT, shader bytecode embedded). Put that DLL next to the program, in `C:\Program Files\etherquic`, or point `ETHERQUIC_PYROWAVE_D3D11` at it. `ETHERQUIC_PYROWAVE_D3D11=off` disables the encoder.
+Tag **v0.1.3** publishes `pyrowave_d3d11.dll` (x64, MSVC, static CRT, shader bytecode embedded). Tag v0.1.2 is the earlier quant-0 DLL. Put the DLL next to the program, in `C:\Program Files\etherquic`, or point `ETHERQUIC_PYROWAVE_D3D11` at it. `ETHERQUIC_PYROWAVE_D3D11=off` disables the encoder. It loads `d3d11.dll`, `dxgi.dll`, and `D3DCOMPILER_47.dll`, which Windows already provides.
 
-v0.1.1 encodes a 1280×720 frame on the Radeon HD 6670 that `libpyrowave-shared` decodes as a picture. It loads `d3d11.dll`, `dxgi.dll`, and `D3DCOMPILER_47.dll`, which Windows already provides.
+On the Radeon HD 6670, a warm 1280×720 `encode_cpu` at the 4 bit-per-pixel budget (460800 bytes) is the mean of 8 calls after 8 warmup frames. The first frame in a process compiles the shaders.
+
+| Pattern | ms | Record |
+| --- | ---: | --- |
+| Gradient | 10.4 | 45412 bytes, 1 packet |
+| Mild | 12.1 | 150720 bytes, 3 packets |
+| Desktop | 15.4 | 289280 bytes, 5 packets |
+| Edges | 15.5 | 272244 bytes, 5 packets |
+| Noise | 24.0 | does not fit |
+
+After warmup, a desktop frame spends about 0.6 ms uploading, 3.8 ms in the wavelet, 1.5 ms quantising, and 8.9 ms packing. The gradient's pack is about 4.3 ms. Pack is the long call.
+
+`libpyrowave-shared` 1.0.0 (upstream `a0d2e71`) decoded the four records that fit, on the compute path. The gradient and the desktop match the source. The edge grid and the mild pattern come back as pictures, with wavelet error on the hard edges. A live 1280×720 desktop asked for 60 fps and held about 44–48 fps, near 45 Mbit/s. The live path keeps one frame on the GPU, so the picture is one frame behind the capture.
 
 ## Build
 
@@ -35,7 +47,7 @@ The shared library is `build/Release/pyrowave_d3d11.dll`. Tests link the sources
 
 ## Performance
 
-Wall time per frame for `encode_cpu` through `packetize`, on 2026-10-20. The input is the synthetic I420 frame from `prototype/pwbench.cpp`. The rate cap is `max(W*H*3/16, 32 KiB)`. Each cell is min / avg / max / std after 20 warmup frames, then at least 200 frames and 5 seconds. CPU is this process's share of the machine (32 logical processors on both PCs). Memory is the process working set. Full method, one-core CPU, and private bytes are in [comparison.md](comparison.md).
+The tables below are the 2026-10-20 bench of the previous DLL (tag v0.1.2). That build left rate control at quant 0. The rate cap was `max(W*H*3/16, 32 KiB)`. Each cell is min / avg / max / std after 20 warmup frames, then at least 200 frames and 5 seconds. CPU is this process's share of the machine (32 logical processors on both PCs). Memory is the process working set. The encode-only frame rates in that bench are not a live desktop rate, and they are not the 4 bit-per-pixel encoder in the Release section. Full method, one-core CPU, and private bytes are in [comparison.md](comparison.md).
 
 1280×720, cap 172,800 bytes:
 
@@ -57,4 +69,4 @@ Wall time per frame for `encode_cpu` through `packetize`, on 2026-10-20. The inp
 | HYTE | Vulkan | 0.73 / 0.86 / 5.00 / 0.34 | 0.0 / 1.0 / 2.9 / 0.8 | 203.2 / 203.6 / 203.7 / 0.1 |
 | HYTE | D3D11 | 0.92 / 1.09 / 5.50 / 0.37 | 2.3 / 3.5 / 5.6 / 0.6 | 58.4 / 59.6 / 59.6 / 0.2 |
 
-Lavapipe and Vulkan fill that cap (about 173 KB at 720p and 389 KB at 1080p). This D3D11 build leaves rate control at quant 0, so both GPUs wrote 35,840 bytes at 720p and 73,408 bytes at 1080p. The D3D11 times are for that smaller bitstream.
+Lavapipe and Vulkan fill that cap (about 173 KB at 720p and 389 KB at 1080p). The quant-0 D3D11 DLL wrote 35,840 bytes at 720p and 73,408 bytes at 1080p, so those D3D11 times are for a smaller bitstream than the 4 bit-per-pixel records above.

@@ -158,6 +158,9 @@ PWD3D11_API void           pwd3d11_device_destroy(pwd3d11_device);
 
 PWD3D11_API pwd3d11_result pwd3d11_encoder_create(const pwd3d11_encoder_create_info *, pwd3d11_encoder *out);
 PWD3D11_API pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder, const pwd3d11_cpu_buffer *, const pwd3d11_rate_control *);
+/* Submit queues the frame and returns. Finish maps it. encode_cpu is both, in order. */
+PWD3D11_API pwd3d11_result pwd3d11_encoder_submit(pwd3d11_encoder, const pwd3d11_cpu_buffer *, const pwd3d11_rate_control *);
+PWD3D11_API pwd3d11_result pwd3d11_encoder_finish(pwd3d11_encoder);
 PWD3D11_API pwd3d11_result pwd3d11_encoder_compute_num_packets(pwd3d11_encoder, size_t packet_boundary, size_t *num_packets);
 PWD3D11_API pwd3d11_result pwd3d11_encoder_packetize(pwd3d11_encoder, pwd3d11_packet *packets, size_t packet_boundary,
                                          size_t *num_packets, void *bitstream, size_t size);

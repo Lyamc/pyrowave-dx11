@@ -36,31 +36,20 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint g
     v.w += v.z;
 
     gs_scan[gi] = v.w;
-
-    // Barrier
     GroupMemoryBarrierWithGroupSync();
 
-    // ------------------------------------------------------------------
-    // Windowed Hillis-Steele scan (arf:22-36)
-    // IMPORTANT: loop bound is gl_WorkGroupSize.x / 2 = 256, NOT 512
-    // This is a bug in the reference that must be reproduced (OQ-5)
-    // ------------------------------------------------------------------
-    for (uint step = 1u; step < 256u; step *= 2u) {
+    // Inclusive scan of each uvec4's last component, then add that exclusive
+    // prefix to all four lanes. Adding `up` into v on every Hillis-Steele
+    // step inflated the prefix and left later 32x32 blocks at quant 0.
+    for (uint step = 1u; step < 512u; step *= 2u) {
+        uint addend = (gi >= step) ? gs_scan[gi - step] : 0u;
         GroupMemoryBarrierWithGroupSync();
-
-        uint up = 0u;
-        if (gi >= step) {
-            up = gs_scan[gi - step];
-        }
-
+        gs_scan[gi] += addend;
         GroupMemoryBarrierWithGroupSync();
-
-        v.w += up;
-        gs_scan[gi] = v.w;
     }
 
-    // ------------------------------------------------------------------
-    // Store result (arf:38)
-    // ------------------------------------------------------------------
+    uint excl = (gi == 0u) ? 0u : gs_scan[gi - 1u];
+    v += excl;
+
     u0.Store4(int(offset), v);
 }

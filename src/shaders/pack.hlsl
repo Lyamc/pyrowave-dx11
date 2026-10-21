@@ -14,21 +14,22 @@
 #define MAX_PACKET_WORDS 640  // Max words per 32x32 block
 
 // ------------------------------------------------------------------
-// Push constants (matches BlockPackingPushData, 48 bytes)
+// One dispatch covers every band. Sequence is the only per-frame constant.
+// The band table is 16 uints per band (64 bytes):
+//   0,1   resolution x,y          (unused by the shader)
+//   2,3   32x32 block counts
+//   4,5   8x8 block counts
+//   6     quant resolution code
+//   7     linear group origin of this band
+//   8,9   32x32 block offset, stride
+//   10,11 8x8 block offset, stride
+//   12,13 dispatch width, height in groups
 // ------------------------------------------------------------------
 cbuffer PushConstants : register(b0) {
-    int   resolution_x;               // @0
-    int   resolution_y;               // @4
-    int   resolution_32x32_blocks_x;  // @8
-    int   resolution_32x32_blocks_y;  // @12
-    int   resolution_8x8_blocks_x;    // @16
-    int   resolution_8x8_blocks_y;    // @20
-    uint  quant_resolution_code;      // @24
-    uint  sequence_code;              // @28
-    int   block_offset_32x32;         // @32
-    int   block_stride_32x32;         // @36
-    int   block_offset_8x8;           // @40
-    int   block_stride_8x8;           // @44
+    uint sequence_code;
+    uint band_count;
+    uint _pad0;
+    uint _pad1;
 };
 
 // ------------------------------------------------------------------
@@ -52,6 +53,9 @@ ByteAddressBuffer t1 : register(t1);
 // t2: ByteAddressBuffer = quant buffer (stage 4)
 ByteAddressBuffer t2 : register(t2);
 
+// t3: band table. One raw record per band, shared by every frame.
+ByteAddressBuffer t3 : register(t3);
+
 // ------------------------------------------------------------------
 // Groupshared memory (global scope)
 // ------------------------------------------------------------------
@@ -68,6 +72,15 @@ groupshared uint gs_bits_meta[64];
 
 // gs_base: broadcast base from lane 15
 groupshared uint gs_base[4];
+// Word counts for the four blocks, then the one allocation for the group.
+groupshared uint gs_words[4];
+groupshared uint gs_pack_alloc;
+// Band lookup is uniform for the group. One lane searches; the barrier
+// publishes it. A 64-wide walk of the band table was most of an empty frame.
+groupshared uint gs_pack_band;
+groupshared uint gs_pack_local;
+groupshared uint gs_pack_dx;
+groupshared uint gs_pack_ok;
 
 // Sign bits, 64 per 8x8 lane (2 uints). Compacted after the copy.
 groupshared uint gs_sign[4][32];
@@ -151,8 +164,7 @@ void pkt_put_byte(uint blk, uint local_byte, uint value)
     uint word_idx = local_byte >> 2u;
     uint shift = (local_byte & 3u) << 3u;
     uint idx = blk * MAX_PACKET_WORDS + word_idx;
-    uint mask = 0xffu << shift;
-    InterlockedAnd(gs_pkt[idx], ~mask);
+    // Two lanes share a word on different iterations. A plain Or drops bytes.
     InterlockedOr(gs_pkt[idx], (value & 0xffu) << shift);
 }
 
@@ -165,32 +177,91 @@ void main(uint3 grp : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
     // ------------------------------------------------------------------
     // P0: Zero staging arrays and ballot
     // ------------------------------------------------------------------
-    // Zero every staging word. The old loop only cleared 16 words per block,
-    // and it used the thread id as the word index, so blocks 1..3 lost their headers.
+    // gs_pkt is cleared later, once this block knows how many words it
+    // will publish. Clearing all 640 words here dominated the dispatch.
     uint blk = gi >> 4;
-    for (uint w = gi; w < 4u * MAX_PACKET_WORDS; w += 64u) {
-        gs_pkt[w] = 0u;
-    }
     if (gi < 4u) {
         gs_ballot[gi] = 0u;
         gs_base[gi] = 0u;
+        gs_words[gi] = 0u;
+    }
+    if (gi == 0u) {
+        gs_pack_alloc = 0u;
+        gs_overflow[0] = 0u;
+        // Origins are assigned in order and do not overlap, so the group id
+        // binary-searches the same band the linear walk found.
+        uint lo = 0u;
+        uint hi = band_count;
+        uint found_band = 0u;
+        uint found_local = 0u;
+        uint found_dx = 1u;
+        uint found_ok = 0u;
+        uint gid0 = grp.x;
+        [loop]
+        while (lo < hi) {
+            uint mid = (lo + hi) >> 1u;
+            uint irec = mid * 64u;
+            uint origin = t3.Load(irec + 28u);
+            uint dx = t3.Load(irec + 48u);
+            uint dy = t3.Load(irec + 52u);
+            uint ngrp = dx * dy;
+            if (gid0 < origin) {
+                hi = mid;
+            } else if (gid0 >= origin + ngrp) {
+                lo = mid + 1u;
+            } else {
+                found_band = mid;
+                found_local = gid0 - origin;
+                found_dx = dx;
+                found_ok = 1u;
+                break;
+            }
+        }
+        gs_pack_band = found_band;
+        gs_pack_local = found_local;
+        gs_pack_dx = found_dx == 0u ? 1u : found_dx;
+        gs_pack_ok = found_ok;
     }
     for (uint s = gi; s < 128u; s += 64u) gs_sign[s >> 5u][s & 31u] = 0u;
-    if (gi == 0u) gs_overflow[0] = 0u;
 
     GroupMemoryBarrierWithGroupSync();  // B1
 
     // ------------------------------------------------------------------
     // P1: Loads, quantize, ballot, per-lane data
     // ------------------------------------------------------------------
+    uint band = gs_pack_band;
+    uint local_g = gs_pack_local;
+    uint disp_x = gs_pack_dx;
+    bool found = gs_pack_ok != 0u;
+    uint rec = band * 64u;
+    int resolution_32x32_blocks_x = int(t3.Load(rec + 8u));
+    int resolution_32x32_blocks_y = int(t3.Load(rec + 12u));
+    int resolution_8x8_blocks_x = int(t3.Load(rec + 16u));
+    int resolution_8x8_blocks_y = int(t3.Load(rec + 20u));
+    uint quant_resolution_code = t3.Load(rec + 24u);
+    int block_offset_32x32 = int(t3.Load(rec + 32u));
+    int block_stride_32x32 = int(t3.Load(rec + 36u));
+    int block_offset_8x8 = int(t3.Load(rec + 40u));
+    int block_stride_8x8 = int(t3.Load(rec + 44u));
+    if (!found || disp_x == 0u) {
+        resolution_32x32_blocks_x = 0;
+        resolution_32x32_blocks_y = 0;
+        resolution_8x8_blocks_x = 0;
+        resolution_8x8_blocks_y = 0;
+        disp_x = 1u;
+        local_g = 0u;
+    }
+    uint gx = local_g % disp_x;
+    uint gy = local_g / disp_x;
+
     uint linear_block_32x32_index = gi >> 4;
     uint local_block_index = gi & 15u;  // 0..15 within 32x32 block
     uint local_x = local_block_index & 3u;
     uint local_y = local_block_index >> 2;
 
-    // block_packing.comp: block32 = 2 * gl_WorkGroupID + (bit4, bit5 of the lane).
-    int block32x32_x = 2 * int(grp.x) + int((gi >> 4) & 1u);
-    int block32x32_y = 2 * int(grp.y) + int((gi >> 5) & 1u);
+    // block_packing.comp: block32 = 2 * workgroup + (bit4, bit5 of the lane).
+    int block32x32_x = 2 * int(gx) + int((gi >> 4) & 1u);
+    int block32x32_y = 2 * int(gy) + int((gi >> 5) & 1u);
 
     // 8x8 block index
     int block8x8_x = 4 * block32x32_x + int(local_x);
@@ -237,6 +308,11 @@ void main(uint3 grp : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
 
     GroupMemoryBarrierWithGroupSync();  // B2
 
+    // A group whose four blocks are empty writes nothing. Meta was cleared,
+    // and packetize skips a zero word count. Every lane sees the same ballots.
+    if ((gs_ballot[0] | gs_ballot[1] | gs_ballot[2] | gs_ballot[3]) == 0u)
+        return;
+
     // ------------------------------------------------------------------
     // P2: Sums and scans from groupshared; lane 15 allocates base
     // ------------------------------------------------------------------
@@ -252,16 +328,29 @@ void main(uint3 grp : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
     // Lane 15 of each block allocates
     bool writes_header = in_range_32x32 && (local_block_index == 15u);
 
-    uint base = 0u;
-    if (writes_header && total_words != 0u) {
-        u2.InterlockedAdd(4, total_words, base);
+    // One atomic for the four 32x32 blocks in this group. A per-block
+    // InterlockedAdd on the same address serializes on the HD 6670. The
+    // word offset is not stored in the packet; packetize copies by meta.
+    if (local_block_index == 15u)
+        gs_words[blk] = (writes_header && total_words != 0u) ? total_words : 0u;
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0u) {
+        uint sum = gs_words[0] + gs_words[1] + gs_words[2] + gs_words[3];
+        uint alloc = 0u;
+        if (sum != 0u) u2.InterlockedAdd(4, sum, alloc);
+        gs_pack_alloc = alloc;
     }
-
-    // Only lane 15 publishes. Every lane writing here raced the real base back to 0.
-    if (local_block_index == 15u) gs_base[blk] = base;
+    GroupMemoryBarrierWithGroupSync();
+    if (local_block_index == 15u) {
+        uint prefix = 0u;
+        [unroll] for (uint b = 0u; b < 4u; b++) {
+            if (b < blk) prefix += gs_words[b];
+        }
+        gs_base[blk] = (gs_words[blk] != 0u) ? (gs_pack_alloc + prefix) : 0u;
+    }
     GroupMemoryBarrierWithGroupSync();  // B3
 
-    base = gs_base[blk];
+    uint base = gs_base[blk];
 
     // Exclusive scan of plane bytes over the 16 lanes.
     uint exclusive_plane = 0u;
@@ -277,6 +366,14 @@ void main(uint3 grp : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
 
     // Total active blocks (popcount of ballot)
     uint N = countbits(gs_ballot[blk]);
+
+    // Only the words this block will copy out. An Or into a stale word
+    // would mix in whatever the groupshared slot held.
+    if (total_words != 0u && total_words <= uint(MAX_PACKET_WORDS)) {
+        for (uint zw = local_block_index; zw < total_words; zw += 16u)
+            gs_pkt[blk * MAX_PACKET_WORDS + zw] = 0u;
+    }
+    GroupMemoryBarrierWithGroupSync();
 
     // ------------------------------------------------------------------
     // P3: Header words, code word, q byte, planes and signs into gs_pkt
@@ -320,6 +417,12 @@ void main(uint3 grp : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
         uint out_q_bits = (code_word >> Q_PLANES_OFFSET) & 0xfu;
         uint in_offset = t0.Load(int(meta_addr + 4u));
         uint out_offset = 8u + 3u * N + exclusive_plane;
+        // Magnitude bytes are contiguous for this lane. A word that sits
+        // entirely inside the run is stored directly; only the unaligned
+        // edges share a word with the next lane and stay atomic.
+        uint pacc = 0u;
+        uint pfill = 0u;
+        uint pnext = out_offset;
 
         for (int sb = 0; sb < 16; sb += 2) {
             uint out_planes = ((code_word >> uint(sb)) & 3u) + out_q_bits;
@@ -332,7 +435,19 @@ void main(uint3 grp : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
                 for (uint p = 0u; p < out_planes; p++) {
                     uint byte_val = load_payload_byte(u2, in_offset + 1u + p);
                     significant_mask |= byte_val;
-                    pkt_put_byte(blk, out_offset + p, byte_val);
+                    if (pfill == 0u && (pnext & 3u) != 0u) {
+                        pkt_put_byte(blk, pnext, byte_val);
+                        pnext++;
+                    } else {
+                        pacc |= (byte_val & 0xffu) << (pfill * 8u);
+                        pfill++;
+                        if (pfill == 4u) {
+                            gs_pkt[blk * MAX_PACKET_WORDS + (pnext >> 2u)] = pacc;
+                            pnext += 4u;
+                            pacc = 0u;
+                            pfill = 0u;
+                        }
+                    }
                 }
                 out_offset += out_planes;
 
@@ -350,6 +465,8 @@ void main(uint3 grp : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
 
             in_offset += in_planes;
         }
+        for (uint tail = 0u; tail < pfill; tail++)
+            pkt_put_byte(blk, pnext + tail, (pacc >> (tail * 8u)) & 0xffu);
     }
     gs_sign_bits[gi] = local_sign_bits;
 

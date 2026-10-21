@@ -16,28 +16,42 @@
 #include "stage_funcs.h"
 #include "stage_internal.h"
 #include "shaders/pack_dxbc.h"
+#include "shaders/clamp_dxbc.h"
 #include "debug_dump.h"
 
 using Microsoft::WRL::ComPtr;
 
 // ------------------------------------------------------------------
-// Push constants for pack shader (BlockPackingPushData, 48 bytes)
+// Pack runs as one dispatch. The band table is immutable for this size.
+// Sequence is a separate 16-byte constant so the table is not rebuilt.
 // ------------------------------------------------------------------
-struct PackPushConstants {
-    int   resolution_x;
-    int   resolution_y;
-    int   resolution_32x32_blocks_x;
-    int   resolution_32x32_blocks_y;
-    int   resolution_8x8_blocks_x;
-    int   resolution_8x8_blocks_y;
-    unsigned int quant_resolution_code;
-    unsigned int seq_code;
-    int   block_offset_32x32;
-    int   block_stride_32x32;
-    int   block_offset_8x8;
-    int   block_stride_8x8;
+struct PackBandRecord {
+    uint32_t resolution_x;
+    uint32_t resolution_y;
+    uint32_t blocks_32_x;
+    uint32_t blocks_32_y;
+    uint32_t blocks_8_x;
+    uint32_t blocks_8_y;
+    uint32_t quant_resolution_code;
+    uint32_t group_origin;
+    uint32_t block_offset_32;
+    uint32_t block_stride_32;
+    uint32_t block_offset_8;
+    uint32_t block_stride_8;
+    uint32_t disp_x;
+    uint32_t disp_y;
+    uint32_t pad0;
+    uint32_t pad1;
 };
-static_assert(sizeof(PackPushConstants) == 48, "PackPushConstants must be 48 bytes");
+static_assert(sizeof(PackBandRecord) == 64, "pack band record must be 64 bytes");
+
+struct PackSeqCB {
+    uint32_t sequence_code;
+    uint32_t band_count;
+    uint32_t pad0;
+    uint32_t pad1;
+};
+static_assert(sizeof(PackSeqCB) == 16, "pack sequence constant must be 16 bytes");
 
 static unsigned quant_code_for_band(int level, int component, int band)
 {
@@ -135,7 +149,11 @@ static std::vector<uint8_t> readback_buffer(ID3D11Device *dev, ID3D11DeviceConte
     HRESULT hr = dev->CreateBuffer(&bd, nullptr, &staging);
     if (FAILED(hr)) return {};
 
-    ctx->CopyResource(staging.Get(), buf);
+    D3D11_BOX box = {};
+    box.right = UINT(size);
+    box.bottom = 1;
+    box.back = 1;
+    ctx->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, buf, 0, &box);
     ctx->Flush();
 
     D3D11_MAPPED_SUBRESOURCE ms;
@@ -146,6 +164,20 @@ static std::vector<uint8_t> readback_buffer(ID3D11Device *dev, ID3D11DeviceConte
                                 static_cast<uint8_t*>(ms.pData) + size);
     ctx->Unmap(staging.Get(), 0);
     return result;
+}
+
+static HRESULT ensure_staging(ID3D11Device *dev, ComPtr<ID3D11Buffer> &buf,
+                              size_t *have, size_t need)
+{
+    if (buf && *have >= need) return S_OK;
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = UINT(need);
+    bd.Usage = D3D11_USAGE_STAGING;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    buf.Reset();
+    HRESULT hr = dev->CreateBuffer(&bd, nullptr, &buf);
+    if (SUCCEEDED(hr)) *have = need;
+    return hr;
 }
 
 // ------------------------------------------------------------------
@@ -257,6 +289,55 @@ pwd3d11_result pwd3d11_encoder_create(const pwd3d11_encoder_create_info *info, p
         return PWD3D11_ERROR_GENERIC;
     }
 
+    hr_d3d = enc->d3d11_device->CreateComputeShader(
+        const_cast<unsigned char*>(g_clamp_dxbc),
+        g_clamp_dxbc_len,
+        nullptr,
+        &enc->clamp_shader
+    );
+    if (!SUCCEEDED(hr_d3d)) {
+        resolve_destroy(enc->resolve);
+        analyze_destroy(enc->analyze);
+        quant_destroy(enc->quant);
+        dwt_destroy(enc->dwt);
+        delete enc->resolve;
+        delete enc->analyze;
+        delete enc->quant;
+        delete enc->dwt;
+        delete enc;
+        *out = nullptr;
+        return PWD3D11_ERROR_GENERIC;
+    }
+
+    hr = analyze_compile_shaders(enc->analyze);
+    if (hr != PWD3D11_SUCCESS) {
+        resolve_destroy(enc->resolve);
+        analyze_destroy(enc->analyze);
+        quant_destroy(enc->quant);
+        dwt_destroy(enc->dwt);
+        delete enc->resolve;
+        delete enc->analyze;
+        delete enc->quant;
+        delete enc->dwt;
+        delete enc;
+        *out = nullptr;
+        return hr;
+    }
+    hr = resolve_compile_shaders(enc->resolve);
+    if (hr != PWD3D11_SUCCESS) {
+        resolve_destroy(enc->resolve);
+        analyze_destroy(enc->analyze);
+        quant_destroy(enc->quant);
+        dwt_destroy(enc->dwt);
+        delete enc->resolve;
+        delete enc->analyze;
+        delete enc->quant;
+        delete enc->dwt;
+        delete enc;
+        *out = nullptr;
+        return hr;
+    }
+
     *out = enc;
     return PWD3D11_SUCCESS;
 }
@@ -264,19 +345,93 @@ pwd3d11_result pwd3d11_encoder_create(const pwd3d11_encoder_create_info *info, p
 // ------------------------------------------------------------------
 // Encode a frame: dispatch pipeline, readback, packetize
 // ------------------------------------------------------------------
-pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder enc,
-                                           const pwd3d11_cpu_buffer *buf,
-                                           const pwd3d11_rate_control *rc)
+static int pwd3_stage_on()
+{
+    static int on = -1;
+    if (on < 0) {
+        char buf[8] = {};
+        DWORD n = GetEnvironmentVariableA("PWD3_STAGE", buf, sizeof buf);
+        on = (n > 0 && buf[0] != '0') ? 1 : 0;
+    }
+    return on;
+}
+
+static void pwd3_ts_ensure(pwd3d11_encoder enc)
+{
+    if (enc->ts_disjoint) return;
+    D3D11_QUERY_DESC desc = {};
+    desc.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+    enc->d3d11_device->CreateQuery(&desc, &enc->ts_disjoint);
+    desc.Query = D3D11_QUERY_TIMESTAMP;
+    for (int i = 0; i < 6; i++)
+        enc->d3d11_device->CreateQuery(&desc, &enc->ts_mark[i]);
+}
+
+static void pwd3_ts_mark(pwd3d11_encoder enc, int index)
+{
+    if (!pwd3_stage_on() || !enc->ts_mark[index]) return;
+    enc->context->End(enc->ts_mark[index].Get());
+}
+
+static void pwd3_ts_report(pwd3d11_encoder enc)
+{
+    if (!pwd3_stage_on() || !enc->ts_disjoint) return;
+    auto ctx = enc->context;
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint = {};
+    HRESULT hr = S_FALSE;
+    for (int spin = 0; spin < 1000 && hr == S_FALSE; spin++)
+        hr = ctx->GetData(enc->ts_disjoint.Get(), &disjoint, sizeof disjoint, 0);
+    if (hr != S_OK || disjoint.Disjoint) {
+        fprintf(stderr, "stage gpu unavailable\n");
+        return;
+    }
+    UINT64 tick[6] = {};
+    for (int i = 0; i < 6; i++) {
+        hr = S_FALSE;
+        for (int spin = 0; spin < 1000 && hr == S_FALSE; spin++)
+            hr = ctx->GetData(enc->ts_mark[i].Get(), &tick[i], sizeof tick[i], 0);
+        if (hr != S_OK) {
+            fprintf(stderr, "stage gpu mark %d missing\n", i);
+            return;
+        }
+    }
+    double scale = 1000.0 / double(disjoint.Frequency);
+    static const char *name[5] = { "upload", "dwt", "quant", "clamp", "pack" };
+    for (int i = 0; i < 5; i++)
+        fprintf(stderr, "gpu %s %.2f\n", name[i], double(tick[i + 1] - tick[i]) * scale);
+}
+
+pwd3d11_result pwd3d11_encoder_submit(pwd3d11_encoder enc,
+                                        const pwd3d11_cpu_buffer *buf,
+                                        const pwd3d11_rate_control *rc)
 {
     if (!enc || !buf || !rc) return PWD3D11_ERROR_INVALID_ARGUMENT;
+    // The previous frame still owns the payload and the staging copy.
+    if (enc->gpu_inflight) return PWD3D11_ERROR_INVALID_ARGUMENT;
+    const bool subsampled =
+        buf->format == PWD3D11_CPU_BUFFER_FORMAT_YUV420P
+        || buf->format == PWD3D11_CPU_BUFFER_FORMAT_YUV420P10
+        || buf->format == PWD3D11_CPU_BUFFER_FORMAT_YUV420P16
+        || buf->format == PWD3D11_CPU_BUFFER_FORMAT_NV12;
+    if (enc->chroma == PWD3D11_CHROMA_SUBSAMPLING_420 && !subsampled)
+        return PWD3D11_ERROR_INVALID_ARGUMENT;
+    if (enc->chroma == PWD3D11_CHROMA_SUBSAMPLING_444 && subsampled)
+        return PWD3D11_ERROR_INVALID_ARGUMENT;
 
     auto ctx = enc->context;
     if (!ctx) return PWD3D11_ERROR_INVALID_ARGUMENT;
     HRESULT hr_d3d;
+    pwd3d11_unbind_cs(ctx.Get());
+    if (pwd3_stage_on()) {
+        pwd3_ts_ensure(enc);
+        if (enc->ts_disjoint) ctx->Begin(enc->ts_disjoint.Get());
+        pwd3_ts_mark(enc, 0);
+    }
 
     // Step 1: Upload planes and run DWT
     pwd3d11_result hr = dwt_upload_planes(enc->dwt, buf);
     if (hr != PWD3D11_SUCCESS) return hr;
+    pwd3_ts_mark(enc, 1);
 
     hr = dwt_create_bands(enc->dwt);
     if (hr != PWD3D11_SUCCESS) return hr;
@@ -286,6 +441,7 @@ pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder enc,
 
     hr = dwt_run(enc->dwt);
     if (hr != PWD3D11_SUCCESS) return hr;
+    pwd3_ts_mark(enc, 2);
 
     // DWT debug dump: skip band textures (requires texture readback, less critical)
 
@@ -333,6 +489,7 @@ pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder enc,
 
     hr = quant_run(enc->quant);
     if (hr != PWD3D11_SUCCESS) return hr;
+    pwd3_ts_mark(enc, 3);
 
     // Quant debug dump: meta, stats, payload
     if (enc->dump_dir[0]) {
@@ -366,8 +523,6 @@ pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder enc,
         }
     }
 
-    // Rate control stays at quant 0. The resolve shader's workgroup id did not
-    // match the Vulkan dispatch, and a nonzero garbage quant drops every plane.
     int count8 = enc->quant->total_blocks;
     int count32 = enc->quant->total_blocks_32;
     hr = analyze_set_stats(enc->analyze, enc->quant->stats_buf.Get(), count8, count32);
@@ -375,153 +530,263 @@ pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder enc,
 
     hr = analyze_create_buffers(enc->analyze);
     if (hr != PWD3D11_SUCCESS) return hr;
+    enc->resolve->per_sub = enc->analyze->per_sub;
 
-    UINT zero_quant[4] = {};
-    ctx->ClearUnorderedAccessViewUint(enc->analyze->uav_quant.Get(), zero_quant);
+    pwd3d11_unbind_cs(ctx.Get());
+    UINT zero_rc[4] = {};
+    ctx->ClearUnorderedAccessViewUint(enc->analyze->uav_quant.Get(), zero_rc);
+
+    // Skip analyze/resolve. Occupancy-class DWT+quant+pack already fits a
+    // desktop 720p frame at quant 0. A busy frame's payload counter is over
+    // the budget; leftover clamp then raises quant so pack does not overflow.
+    if (enc->clamp_shader && count32 > 0 && enc->quant->srv_payload) {
+        unsigned target_bytes = unsigned(rc->maximum_bitstream_size);
+        struct ClampPush {
+            unsigned target_bytes;
+            unsigned block_count;
+            unsigned floor_q;
+            unsigned cap_q;
+        } pc_clamp = { target_bytes, unsigned(count32), 7u, 6u };
+        ID3D11Buffer *cb_clamp = nullptr;
+        hr_d3d = pwd3d11_cached_cb(enc->d3d11_device.Get(), enc->clamp_cbs, 0,
+                                   &pc_clamp, sizeof(pc_clamp), &cb_clamp);
+        if (FAILED(hr_d3d)) return PWD3D11_ERROR_GENERIC;
+        pwd3d11_unbind_cs(ctx.Get());
+        ID3D11ShaderResourceView *clamp_srv[1] = { enc->quant->srv_payload.Get() };
+        ID3D11UnorderedAccessView *clamp_uav[1] = { enc->analyze->uav_quant.Get() };
+        ctx->CSSetShader(enc->clamp_shader.Get(), nullptr, 0);
+        ctx->CSSetConstantBuffers(0, 1, &cb_clamp);
+        ctx->CSSetShaderResources(0, 1, clamp_srv);
+        ctx->CSSetUnorderedAccessViews(0, 1, clamp_uav, nullptr);
+        ctx->Dispatch((UINT(count32) + 63u) / 64u, 1, 1);
+        pwd3d11_unbind_cs(ctx.Get());
+    }
+    pwd3_ts_mark(enc, 4);
 
     // Step 5: Allocate bitstream and meta buffers
     int total_blocks = count32;
-    enc->meta_size = total_blocks * 8;
-    enc->bitstream_size = rc->maximum_bitstream_size + enc->meta_size;
-    enc->bitstream_size = (enc->bitstream_size + 3u) & ~3u;
+    size_t meta_size = size_t(total_blocks) * 8u;
+    size_t bitstream_size = rc->maximum_bitstream_size + meta_size;
+    bitstream_size = (bitstream_size + 3u) & ~3u;
 
-    D3D11_BUFFER_DESC bd = {};
-    bd.ByteWidth = UINT(enc->bitstream_size);
-    bd.Usage = D3D11_USAGE_DEFAULT;
-    bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-    hr_d3d = enc->d3d11_device->CreateBuffer(&bd, nullptr, &enc->bitstream_buf);
-    if (FAILED(hr_d3d)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (!enc->bitstream_buf || enc->bitstream_size != bitstream_size) {
+        enc->bitstream_buf.Reset();
+        enc->uav_bitstream.Reset();
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = UINT(bitstream_size);
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        hr_d3d = enc->d3d11_device->CreateBuffer(&bd, nullptr, &enc->bitstream_buf);
+        if (FAILED(hr_d3d)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
 
-    D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
-    ud.Format = DXGI_FORMAT_R32_UINT;
-    ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-    ud.Buffer.NumElements = UINT(enc->bitstream_size / 4);
-    hr_d3d = enc->d3d11_device->CreateUnorderedAccessView(enc->bitstream_buf.Get(), &ud, &enc->uav_bitstream);
-    if (FAILED(hr_d3d)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format = DXGI_FORMAT_R32_UINT;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer.NumElements = UINT(bitstream_size / 4);
+        hr_d3d = enc->d3d11_device->CreateUnorderedAccessView(enc->bitstream_buf.Get(), &ud, &enc->uav_bitstream);
+        if (FAILED(hr_d3d)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
+        enc->bitstream_size = bitstream_size;
+    }
 
-    bd.ByteWidth = UINT(enc->meta_size);
-    bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-    hr_d3d = enc->d3d11_device->CreateBuffer(&bd, nullptr, &enc->meta_buf);
-    if (FAILED(hr_d3d)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (!enc->meta_buf || enc->meta_size != meta_size) {
+        enc->meta_buf.Reset();
+        enc->uav_meta.Reset();
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = UINT(meta_size);
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        hr_d3d = enc->d3d11_device->CreateBuffer(&bd, nullptr, &enc->meta_buf);
+        if (FAILED(hr_d3d)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
 
-    ud.Buffer.NumElements = UINT(enc->meta_size / 4);
-    hr_d3d = enc->d3d11_device->CreateUnorderedAccessView(enc->meta_buf.Get(), &ud, &enc->uav_meta);
-    if (FAILED(hr_d3d)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format = DXGI_FORMAT_R32_UINT;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer.NumElements = UINT(meta_size / 4);
+        hr_d3d = enc->d3d11_device->CreateUnorderedAccessView(enc->meta_buf.Get(), &ud, &enc->uav_meta);
+        if (FAILED(hr_d3d)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
+        enc->meta_size = meta_size;
+    }
 
+    pwd3d11_unbind_cs(ctx.Get());
     UINT zero_bits[4] = {};
-    ctx->ClearUnorderedAccessViewUint(enc->uav_bitstream.Get(), zero_bits);
     ctx->ClearUnorderedAccessViewUint(enc->uav_meta.Get(), zero_bits);
 
-    // Create SRVs for pack shader inputs. Meta and stats are per 8x8 block.
-    D3D11_SHADER_RESOURCE_VIEW_DESC sd_meta = {};
-    sd_meta.Format = DXGI_FORMAT_R32_UINT;
-    sd_meta.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
-    sd_meta.Buffer.NumElements = UINT(count8 * 2);
+    if (!enc->srv_pack_meta || enc->pack_srv_count8 != count8) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd_meta = {};
+        sd_meta.Format = DXGI_FORMAT_R32_UINT;
+        sd_meta.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+        sd_meta.Buffer.NumElements = UINT(count8 * 2);
+        hr_d3d = enc->d3d11_device->CreateShaderResourceView(enc->quant->meta_buf.Get(),
+                                                            &sd_meta, &enc->srv_pack_meta);
+        if (FAILED(hr_d3d)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
 
-    ComPtr<ID3D11ShaderResourceView> srv_meta;
-    hr_d3d = enc->d3d11_device->CreateShaderResourceView(enc->quant->meta_buf.Get(), &sd_meta, &srv_meta);
-    if (FAILED(hr_d3d)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
-
-    D3D11_SHADER_RESOURCE_VIEW_DESC sd_stats = {};
-    sd_stats.Format = DXGI_FORMAT_R32_UINT;
-    sd_stats.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
-    sd_stats.Buffer.NumElements = UINT(count8 * 16);
-
-    ComPtr<ID3D11ShaderResourceView> srv_stats;
-    hr_d3d = enc->d3d11_device->CreateShaderResourceView(enc->quant->stats_buf.Get(), &sd_stats, &srv_stats);
-    if (FAILED(hr_d3d)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
-
-    D3D11_SHADER_RESOURCE_VIEW_DESC sd_quant = {};
-    sd_quant.Format = DXGI_FORMAT_R32_SINT;
-    sd_quant.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
-    sd_quant.Buffer.NumElements = UINT(count32);
-
-    ComPtr<ID3D11ShaderResourceView> srv_quant;
-    hr_d3d = enc->d3d11_device->CreateShaderResourceView(enc->analyze->quant_buf.Get(), &sd_quant, &srv_quant);
-    if (FAILED(hr_d3d)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
-
-    // One 64-thread group packs a 2x2 of 32x32 blocks. Same dispatch as
-    // Encoder::Impl::block_packing.
-    for (const auto &b : enc->quant->bands) {
-        int blocks_32x32_x = (b.w + 31) / 32;
-        int blocks_32x32_y = (b.h + 31) / 32;
-        PackPushConstants pc = {};
-        pc.resolution_x = b.w;
-        pc.resolution_y = b.h;
-        pc.resolution_32x32_blocks_x = blocks_32x32_x;
-        pc.resolution_32x32_blocks_y = blocks_32x32_y;
-        pc.resolution_8x8_blocks_x = (b.w + 7) / 8;
-        pc.resolution_8x8_blocks_y = (b.h + 7) / 8;
-        pc.quant_resolution_code = quant_code_for_band(b.level, b.component, b.band);
-        pc.seq_code = enc->sequence_code;
-        pc.block_offset_32x32 = b.block_offset_32;
-        pc.block_stride_32x32 = b.block_stride_32;
-        pc.block_offset_8x8 = b.block_offset_8;
-        pc.block_stride_8x8 = b.block_stride_8;
-
-        ComPtr<ID3D11Buffer> cb;
-        D3D11_BUFFER_DESC cbd = {};
-        cbd.ByteWidth = sizeof(PackPushConstants);
-        cbd.Usage = D3D11_USAGE_IMMUTABLE;
-        cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        D3D11_SUBRESOURCE_DATA csd = { &pc, 0, 0 };
-        hr_d3d = enc->d3d11_device->CreateBuffer(&cbd, &csd, &cb);
-        if (FAILED(hr_d3d)) return PWD3D11_ERROR_GENERIC;
-
-        ID3D11ComputeShader *pack_cs = enc->pack_shader.Get();
-        ID3D11ShaderResourceView *srvs[3] = { srv_meta.Get(), srv_stats.Get(), srv_quant.Get() };
-        ID3D11UnorderedAccessView *uavs[3] = { enc->uav_bitstream.Get(), enc->uav_meta.Get(), enc->quant->uav_payload.Get() };
-
-        ctx->CSSetShader(pack_cs, nullptr, 0);
-        ctx->CSSetConstantBuffers(0, 1, cb.GetAddressOf());
-        ctx->CSSetShaderResources(0, 3, srvs);
-        ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
-        ctx->Dispatch(UINT((blocks_32x32_x + 1) / 2), UINT((blocks_32x32_y + 1) / 2), 1);
-
-        ID3D11ShaderResourceView *nullsrv[3] = {};
-        ID3D11UnorderedAccessView *nulluav[3] = {};
-        ctx->CSSetShaderResources(0, 3, nullsrv);
-        ctx->CSSetUnorderedAccessViews(0, 3, nulluav, nullptr);
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd_stats = {};
+        sd_stats.Format = DXGI_FORMAT_R32_UINT;
+        sd_stats.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+        sd_stats.Buffer.NumElements = UINT(count8 * 16);
+        hr_d3d = enc->d3d11_device->CreateShaderResourceView(enc->quant->stats_buf.Get(),
+                                                            &sd_stats, &enc->srv_pack_stats);
+        if (FAILED(hr_d3d)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
+        enc->pack_srv_count8 = count8;
     }
 
-    // Step 7: Readback bitstream
-    D3D11_BUFFER_DESC bd_staging = {};
-    bd_staging.ByteWidth = UINT(enc->bitstream_size);
-    bd_staging.Usage = D3D11_USAGE_STAGING;
-    bd_staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    bd_staging.BindFlags = 0;
+    if (!enc->srv_pack_quant || enc->pack_srv_count32 != count32) {
+        hr_d3d = pwd3d11_create_raw_srv(enc->d3d11_device.Get(), enc->analyze->quant_buf.Get(),
+                                        UINT(count32) * 4u, enc->srv_pack_quant.ReleaseAndGetAddressOf());
+        if (FAILED(hr_d3d)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
+        enc->pack_srv_count32 = count32;
+    }
 
-    ComPtr<ID3D11Buffer> staging_buf;
-    hr_d3d = enc->d3d11_device->CreateBuffer(&bd_staging, nullptr, &staging_buf);
+    std::vector<PackBandRecord> recs;
+    recs.reserve(enc->quant->bands.size());
+    uint32_t origin = 0;
+    for (const auto &b : enc->quant->bands) {
+        PackBandRecord r = {};
+        uint32_t b32x = uint32_t((b.w + 31) / 32);
+        uint32_t b32y = uint32_t((b.h + 31) / 32);
+        uint32_t dx = (b32x + 1u) / 2u;
+        uint32_t dy = (b32y + 1u) / 2u;
+        r.resolution_x = uint32_t(b.w);
+        r.resolution_y = uint32_t(b.h);
+        r.blocks_32_x = b32x;
+        r.blocks_32_y = b32y;
+        r.blocks_8_x = uint32_t((b.w + 7) / 8);
+        r.blocks_8_y = uint32_t((b.h + 7) / 8);
+        r.quant_resolution_code = quant_code_for_band(b.level, b.component, b.band);
+        r.group_origin = origin;
+        r.block_offset_32 = uint32_t(b.block_offset_32);
+        r.block_stride_32 = uint32_t(b.block_stride_32);
+        r.block_offset_8 = uint32_t(b.block_offset_8);
+        r.block_stride_8 = uint32_t(b.block_stride_8);
+        r.disp_x = dx;
+        r.disp_y = dy;
+        origin += dx * dy;
+        recs.push_back(r);
+    }
+    const uint32_t *words = reinterpret_cast<const uint32_t *>(recs.data());
+    size_t nwords = recs.size() * (sizeof(PackBandRecord) / sizeof(uint32_t));
+    bool same_table = enc->srv_pack_bands && enc->pack_band_words.size() == nwords
+        && memcmp(enc->pack_band_words.data(), words, nwords * sizeof(uint32_t)) == 0;
+    if (!recs.empty() && !same_table) {
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = UINT(nwords * sizeof(uint32_t));
+        bd.Usage = D3D11_USAGE_IMMUTABLE;
+        bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+        D3D11_SUBRESOURCE_DATA sd = { words, 0, 0 };
+        hr_d3d = enc->d3d11_device->CreateBuffer(&bd, &sd, &enc->pack_bands);
+        if (FAILED(hr_d3d)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
+        srvd.Format = DXGI_FORMAT_R32_TYPELESS;
+        srvd.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+        srvd.BufferEx.NumElements = UINT(nwords);
+        srvd.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+        hr_d3d = enc->d3d11_device->CreateShaderResourceView(enc->pack_bands.Get(), &srvd, &enc->srv_pack_bands);
+        if (FAILED(hr_d3d)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
+        enc->pack_band_words.assign(words, words + nwords);
+        enc->pack_groups = origin;
+        for (uint32_t s = 0; s < 7; s++) enc->pack_seq_cb[s].Reset();
+    }
+    if (!recs.empty() && !enc->pack_seq_cb[0]) {
+        for (uint32_t s = 0; s < 7; s++) {
+            PackSeqCB seq = {};
+            seq.sequence_code = s + 1u;
+            seq.band_count = uint32_t(recs.size());
+            D3D11_BUFFER_DESC cbd = {};
+            cbd.ByteWidth = sizeof(PackSeqCB);
+            cbd.Usage = D3D11_USAGE_IMMUTABLE;
+            cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            D3D11_SUBRESOURCE_DATA csd = { &seq, 0, 0 };
+            hr_d3d = enc->d3d11_device->CreateBuffer(&cbd, &csd, &enc->pack_seq_cb[s]);
+            if (FAILED(hr_d3d)) return PWD3D11_ERROR_GENERIC;
+        }
+    }
+
+    ID3D11ShaderResourceView *pack_srvs[4] = {
+        enc->srv_pack_meta.Get(), enc->srv_pack_stats.Get(), enc->srv_pack_quant.Get(),
+        enc->srv_pack_bands.Get()
+    };
+    ID3D11UnorderedAccessView *pack_uavs[3] = {
+        enc->uav_bitstream.Get(), enc->uav_meta.Get(), enc->quant->uav_payload.Get()
+    };
+    ctx->CSSetShader(enc->pack_shader.Get(), nullptr, 0);
+    ctx->CSSetShaderResources(0, 4, pack_srvs);
+    ctx->CSSetUnorderedAccessViews(0, 3, pack_uavs, nullptr);
+    unsigned seq_slot = enc->sequence_code - 1u;
+    if (seq_slot > 6u || !enc->pack_seq_cb[seq_slot]) return PWD3D11_ERROR_GENERIC;
+    ctx->CSSetConstantBuffers(0, 1, enc->pack_seq_cb[seq_slot].GetAddressOf());
+    if (enc->pack_groups)
+        ctx->Dispatch(enc->pack_groups, 1, 1);
+    pwd3_ts_mark(enc, 5);
+    if (pwd3_stage_on() && enc->ts_disjoint) ctx->End(enc->ts_disjoint.Get());
+
+    ID3D11ShaderResourceView *nullsrv[4] = {};
+    ID3D11UnorderedAccessView *nulluav[3] = {};
+    ctx->CSSetShaderResources(0, 4, nullsrv);
+    ctx->CSSetUnorderedAccessViews(0, 3, nulluav, nullptr);
+
+    hr_d3d = ensure_staging(enc->d3d11_device.Get(), enc->staging_bitstream,
+                            &enc->staging_bitstream_size, enc->bitstream_size);
+    if (FAILED(hr_d3d)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
+    hr_d3d = ensure_staging(enc->d3d11_device.Get(), enc->staging_meta,
+                            &enc->staging_meta_size, enc->meta_size);
     if (FAILED(hr_d3d)) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
 
-    ctx->CopyResource(staging_buf.Get(), enc->bitstream_buf.Get());
+    D3D11_BOX bits_box = {};
+    bits_box.right = UINT(enc->bitstream_size);
+    bits_box.bottom = 1;
+    bits_box.back = 1;
+    ctx->CopySubresourceRegion(enc->staging_bitstream.Get(), 0, 0, 0, 0,
+                               enc->bitstream_buf.Get(), 0, &bits_box);
+    D3D11_BOX meta_box = {};
+    meta_box.right = UINT(enc->meta_size);
+    meta_box.bottom = 1;
+    meta_box.back = 1;
+    ctx->CopySubresourceRegion(enc->staging_meta.Get(), 0, 0, 0, 0,
+                               enc->meta_buf.Get(), 0, &meta_box);
     ctx->Flush();
+    enc->block_count = total_blocks;
+    enc->gpu_inflight = 1;
+    return PWD3D11_SUCCESS;
+}
+
+pwd3d11_result pwd3d11_encoder_finish(pwd3d11_encoder enc)
+{
+    if (!enc || !enc->gpu_inflight) return PWD3D11_ERROR_INVALID_ARGUMENT;
+    auto ctx = enc->context;
+    if (!ctx) return PWD3D11_ERROR_INVALID_ARGUMENT;
+    int total_blocks = enc->block_count;
 
     D3D11_MAPPED_SUBRESOURCE ms;
-    hr_d3d = ctx->Map(staging_buf.Get(), 0, D3D11_MAP_READ, 0, &ms);
-    if (FAILED(hr_d3d)) {
-        ctx->Unmap(staging_buf.Get(), 0);
-        return PWD3D11_ERROR_GENERIC;
-    }
-
-    enc->host_bitstream.assign(static_cast<uint8_t*>(ms.pData),
-                               static_cast<uint8_t*>(ms.pData) + enc->bitstream_size);
-    enc->block_count = total_blocks;
-
-    ctx->Unmap(staging_buf.Get(), 0);
-
-    enc->host_meta = readback_buffer(enc->d3d11_device.Get(), ctx.Get(),
-                                     enc->meta_buf.Get(), enc->meta_size);
+    HRESULT hr_d3d = ctx->Map(enc->staging_meta.Get(), 0, D3D11_MAP_READ, 0, &ms);
+    if (FAILED(hr_d3d)) return PWD3D11_ERROR_GENERIC;
+    enc->host_meta.assign(static_cast<uint8_t*>(ms.pData),
+                          static_cast<uint8_t*>(ms.pData) + enc->meta_size);
+    ctx->Unmap(enc->staging_meta.Get(), 0);
     if (enc->host_meta.size() < size_t(total_blocks) * sizeof(BitstreamPacket)) {
         return PWD3D11_ERROR_GENERIC;
     }
+    const auto *block_meta = reinterpret_cast<const BitstreamPacket *>(enc->host_meta.data());
+    size_t extent = 0;
+    for (int bi = 0; bi < total_blocks; bi++) {
+        if (!block_meta[bi].num_words) continue;
+        size_t end = (size_t(block_meta[bi].offset_u32) + block_meta[bi].num_words) * sizeof(uint32_t);
+        if (end > extent) extent = end;
+    }
+    if (extent > enc->bitstream_size) extent = enc->bitstream_size;
+
+    hr_d3d = ctx->Map(enc->staging_bitstream.Get(), 0, D3D11_MAP_READ, 0, &ms);
+    if (FAILED(hr_d3d)) return PWD3D11_ERROR_GENERIC;
+    enc->host_bitstream.assign(static_cast<uint8_t*>(ms.pData),
+                               static_cast<uint8_t*>(ms.pData) + extent);
+    ctx->Unmap(enc->staging_bitstream.Get(), 0);
+    pwd3_ts_report(enc);
 
     // Pack/Packetize debug dump: bitstream and meta
     if (enc->dump_dir[0]) {
         debug_dump_buffer(enc->dump_dir, "bitstream", 5, 1,
-                          UINT(enc->bitstream_size / 4), 1,
-                          enc->host_bitstream.data(), enc->bitstream_size);
+                          UINT(enc->host_bitstream.size() / 4), 1,
+                          enc->host_bitstream.data(), enc->host_bitstream.size());
 
         auto ctx_p = enc->context;
         auto meta_data = readback_buffer(enc->d3d11_device.Get(), ctx_p.Get(),
@@ -533,11 +798,24 @@ pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder enc,
         }
     }
 
-    // Increment sequence code
+    // Same sequence step encode_cpu used to take after the map.
     enc->sequence_code = (enc->sequence_code + 1u) & 7u;
     if (enc->sequence_code == 0u) enc->sequence_code = 1u;
-
+    enc->gpu_inflight = 0;
     return PWD3D11_SUCCESS;
+}
+
+pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder enc,
+                                           const pwd3d11_cpu_buffer *buf,
+                                           const pwd3d11_rate_control *rc)
+{
+    if (enc && enc->gpu_inflight) {
+        pwd3d11_result pending = pwd3d11_encoder_finish(enc);
+        if (pending != PWD3D11_SUCCESS) return pending;
+    }
+    pwd3d11_result hr = pwd3d11_encoder_submit(enc, buf, rc);
+    if (hr != PWD3D11_SUCCESS) return hr;
+    return pwd3d11_encoder_finish(enc);
 }
 
 // ------------------------------------------------------------------

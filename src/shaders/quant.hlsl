@@ -14,15 +14,22 @@
 // Push constants (matches QuantizerPushData in R/pyrowave_encoder.cpp:28-38)
 // ------------------------------------------------------------------
 cbuffer PushConstants : register(b0) {
-    int2  resolution;
-    int2  resolution_8x8_blocks;
-    float2 inv_resolution;
-    float input_layer;
-    float quant_resolution;
-    int   block_offset;
-    int   block_stride;
-    float rdo_distortion_scale;
-    uint  coeff_pitch;
+    int2  resolution                   : packoffset(c0);
+    int2  resolution_8x8_blocks        : packoffset(c0.z);
+    float2 inv_resolution              : packoffset(c1);
+    float input_layer                  : packoffset(c1.z);
+    float quant_resolution             : packoffset(c1.w);
+    int   block_offset                 : packoffset(c2);
+    int   block_stride                 : packoffset(c2.y);
+    float rdo_distortion_scale         : packoffset(c2.z);
+    uint  coeff_pitch                  : packoffset(c2.w);
+};
+
+// Subbands of one level share the coefficient buffer. gid.z picks the row.
+// Fusing them is one launch instead of one launch per subband.
+cbuffer Subbands : register(b1) {
+    float4 band_lq[4];
+    int4 band_off;
 };
 
 // ------------------------------------------------------------------
@@ -44,15 +51,21 @@ RWByteAddressBuffer u2 : register(u2);
 // ------------------------------------------------------------------
 // Groupshared memory (§5.3)
 // ------------------------------------------------------------------
+// 19 bytes per lane when msb <= 16 (docs/stages/02_quant.md). 64 words is
+// 32 bytes per lane. The old 640-word slice was 20 KB and left room for
+// one wave per SIMD on the HD 6670.
+#define CLUSTER_WORDS 64
+#define CLUSTER_BYTES (CLUSTER_WORDS * 4)
+// Pack loads payload[meta+8]. Bytes 8..135 are 32 stripe counters, so the
+// first 8x8 starts at byte 136. The slot index is not part of the packet.
+#define PAYLOAD_SLOT0 128u
+
 groupshared float  gs_max[128];
-groupshared float  gs_tex[128][8];
-groupshared int    gs_b4x2[128];
 groupshared int    gs_early[128];
 groupshared int    gs_ctotal[16];
-groupshared int    gs_group_base[1];
-groupshared uint   gs_staging[640];
-groupshared int    gs_overflow[1];
-groupshared uint   gs_payload_counter[1]; // groupshared counter for payload bytes
+groupshared int    gs_group_base[8];
+groupshared uint   gs_staging[8 * CLUSTER_WORDS];
+groupshared uint   gs_payload_counter[8]; // bytes allocated by this cluster
 groupshared uint   gs_pcode[128];
 
 // firstbithigh(0) is -1. On the HD 6670 it is not, so a 4x2 of zeros inside a
@@ -66,7 +79,8 @@ int msb_of(uint v)
 }
 
 // Coefficient buffer written by the DWT store. Out-of-range texels are 0,
-// matching Texture2D.Load.
+// matching Texture2D.Load. Padding past the logical size is not cleared,
+// so a wide load is only used when all four texels are inside the band.
 float band_at(int layer, int x, int y)
 {
     if ((uint)x >= (uint)resolution.x || (uint)y >= (uint)resolution.y) return 0.0f;
@@ -75,103 +89,74 @@ float band_at(int layer, int x, int y)
     return asfloat(t0.Load(idx * 4u));
 }
 
-// ------------------------------------------------------------------
-// Helper: build 2^q by bit manipulation (exact)
-// ------------------------------------------------------------------
-float make_pow2(int q)
+float4 band_row4(int layer, int x, int y)
 {
-    return asfloat(uint((127 + q) << 23));
+    if ((uint)y >= (uint)resolution.y || (uint)x >= (uint)resolution.x)
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (((uint)x & 3u) == 0u && (uint)x + 3u < (uint)resolution.x) {
+        uint pitch_h = (uint(resolution.y) + 31u) & ~31u;
+        uint idx = uint(layer) * coeff_pitch * pitch_h + uint(y) * coeff_pitch + uint(x);
+        uint4 w = t0.Load4(idx * 4u);
+        return float4(asfloat(w.x), asfloat(w.y), asfloat(w.z), asfloat(w.w));
+    }
+    return float4(
+        band_at(layer, x, y), band_at(layer, x + 1, y),
+        band_at(layer, x + 2, y), band_at(layer, x + 3, y));
 }
 
-// ------------------------------------------------------------------
-// Helper: compute per-thread error and cost for a given q
-// Returns error in high bits, cost in low 16 bits (packed uint)
-// ------------------------------------------------------------------
-uint compute_q_stats(int thread_idx, int q, int msb_val, int block4x2_max_val, float inv_quant_sq_val)
+// gs_staging starts at 0 and each payload byte is written once. A word that
+// this lane fills completely does not share storage with another lane.
+void emit_staged(inout uint acc, inout uint fill, inout uint pos, uint cluster, uint value)
 {
-    // Recompute b4x2 for this thread from scaled texels
-    int b4x2_t = gs_b4x2[thread_idx];
-    int shifted = b4x2_t >> q;
-
-    // encode_cost_early (wq:143-144)
-    int encode_cost_early = (shifted > 0) ? 1 : 0;
-
-    // quality_planes (wq:146-152)
-    int msb_q = msb_val - q;
-    int quality_planes = 0;
-    if (msb_q >= 3) {
-        quality_planes = msb_q - 2;
-        encode_cost_early = quality_planes + 1;
-        shifted >>= quality_planes;
+    if (fill == 0u && (pos & 3u) != 0u) {
+        uint word_idx = cluster * uint(CLUSTER_WORDS) + (pos >> 2u);
+        uint bit_shift = (pos & 3u) << 3u;
+        InterlockedOr(gs_staging[word_idx], (value & 0xffu) << bit_shift);
+        pos++;
+        return;
     }
-
-    encode_cost_early += msb_of(uint(shifted)) + 1;
-
-    // num_sig: count of |s| * 2^-q >= 1.0 over 8 texels (wq:113-128 simplified)
-    int num_sig = 0;
-    for (int k = 0; k < 8; k++) {
-        float v = abs(gs_tex[thread_idx][k]);
-        // iv = floor(v * 2^-q); iv != 0 means v >= 2^q
-        // Since v >= 0, trunc and floor agree
-        float scaled = v * make_pow2(-q);
-        num_sig += (scaled >= 1.0f) ? 1 : 0;
+    acc |= (value & 0xffu) << (fill * 8u);
+    fill++;
+    if (fill == 4u) {
+        gs_staging[cluster * uint(CLUSTER_WORDS) + (pos >> 2u)] = acc;
+        pos += 4u;
+        acc = 0u;
+        fill = 0u;
     }
-
-    // late_bits = 8 * max(encode_cost_early - 1, 0) + num_sig (wq:163)
-    int late_bits = 8 * max(encode_cost_early - 1, 0) + num_sig;
-
-    // Compute square error (wq:113-128, 146)
-    float err_sum = 0.0f;
-    for (int kk = 0; kk < 8; kk++) {
-        float v = abs(gs_tex[thread_idx][kk]);
-        float iv = floor(v * make_pow2(-q));
-        iv += (iv != 0.0f) ? 0.5f : 0.0f;
-        iv = trunc(iv * make_pow2(q));
-        float err = v - iv;
-        err_sum += err * err;
-    }
-
-    // Cluster sum of error using butterfly order
-    float e_t = err_sum * rdo_distortion_scale * inv_quant_sq_val;
-
-    // Return: error f16 in low 16 bits is computed later; return raw error and late_bits separately
-    // We'll compute the packed value in the caller
-    // For now, store error in a separate array
-    return uint(late_bits & 0xffff);
 }
 
-[numthreads(8, 1, 1)]
+[numthreads(64, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)
 {
-    // One 8x8 per group. A 32x32 group put clusters 1..15 at groupshared
-    // indices >= 8, and on the HD 6670 those clusters encoded a 16-wide LL
-    // as a half-scale copy of the left edge. The texture itself is a ramp.
-    for (int zi = int(gi); zi < 640; zi += 8) {
-        gs_staging[zi] = 0u;
-    }
+    // Eight 8x8 blocks per group, one cluster of 8 lanes each. The old single
+    // cluster was a workaround for Texture2D.Load past x or y of 7. Coefficients
+    // now come from the raw buffer, so a full wave is safe. Each cluster keeps
+    // its own staging slice so the payloads do not share words.
+    uint cluster = gi >> 3;
+    uint lane = gi & 7u;
     if (gi == 0u) {
-        gs_overflow[0] = 0;
-        gs_payload_counter[0] = 0u;
-        [unroll] for (int c = 0; c < 16; c++) gs_ctotal[c] = 0;
+        [unroll] for (int c = 0; c < 8; c++) {
+            gs_payload_counter[c] = 0u;
+            gs_group_base[c] = 0;
+        }
+        [unroll] for (int c2 = 0; c2 < 16; c2++) gs_ctotal[c2] = 0;
     }
     GroupMemoryBarrierWithGroupSync();
     // ------------------------------------------------------------------
-    // Thread mapping. gid is the 8x8 block, gi is the lane inside it.
+    // Thread mapping. gid.x covers 8 blocks. gi is cluster * 8 + lane.
     // ------------------------------------------------------------------
-    uint cluster = 0u;
     uint block_x = 0u;
     uint block_y = 0u;
-    uint lane = gi;
     uint local_coord_x = 4 * (lane >> 2);
     uint local_coord_y = 2 * (lane & 3);
-    int2 coord = int2(int(gid.x) * 8 + int(local_coord_x), int(gid.y) * 8 + int(local_coord_y));
+    int2 block8 = int2(int(gid.x) * 8 + int(cluster), int(gid.y));
+    int2 coord = int2(block8.x * 8 + int(local_coord_x), block8.y * 8 + int(local_coord_y));
     uint ublock_x = block_x;
     uint ublock_y = block_y;
-
-    int2 block8 = int2(gid.xy);
     bool in_bounds = (block8.x < resolution_8x8_blocks.x) && (block8.y < resolution_8x8_blocks.y);
-    uint block_linear = uint(block_offset) + uint(block_stride) * uint(block8.y) + uint(block8.x);
-    int layer = (int)input_layer;
+    uint sub = gid.z;
+    uint block_linear = uint(band_off[sub]) + uint(block_stride) * uint(block8.y) + uint(block8.x);
+    int layer = (int)band_lq[sub].x;
 
     // ------------------------------------------------------------------
     // P0: Load texels from the DWT coefficient buffer. Texture2D.Load on the
@@ -181,25 +166,15 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
     int cx = int(coord.x);
     int cy = int(coord.y);
 
-    float t0a_x = band_at(layer, cx, cy);
-    float t0a_y = band_at(layer, cx, cy + 1);
-    float t0a_z = band_at(layer, cx + 1, cy);
-    float t0a_w = band_at(layer, cx + 1, cy + 1);
-    precise float4 t0a = float4(t0a_x, t0a_y, t0a_z, t0a_w);
+    // cx is a multiple of 4. One load per row, then the same 2x2 order as
+    // the scalar loads: (x,y), (x,y+1), (x+1,y), (x+1,y+1).
+    float4 row0 = band_row4(layer, cx, cy);
+    float4 row1 = band_row4(layer, cx, cy + 1);
+    precise float4 t0a = float4(row0.x, row1.x, row0.y, row1.y);
+    precise float4 t0b = float4(row0.z, row1.z, row0.w, row1.w);
 
-    float t0b_x = band_at(layer, cx + 2, cy);
-    float t0b_y = band_at(layer, cx + 2, cy + 1);
-    float t0b_z = band_at(layer, cx + 3, cy);
-    float t0b_w = band_at(layer, cx + 3, cy + 1);
-    precise float4 t0b = float4(t0b_x, t0b_y, t0b_z, t0b_w);
-
-    precise float4 s0 = t0a * quant_resolution;
-    precise float4 s1 = t0b * quant_resolution;
-
-    gs_tex[gi][0] = s0.x; gs_tex[gi][1] = s0.y;
-    gs_tex[gi][2] = s0.z; gs_tex[gi][3] = s0.w;
-    gs_tex[gi][4] = s1.x; gs_tex[gi][5] = s1.y;
-    gs_tex[gi][6] = s1.z; gs_tex[gi][7] = s1.w;
+    precise float4 s0 = t0a * band_lq[sub].y;
+    precise float4 s1 = t0b * band_lq[sub].y;
 
     float m_sub = max(max(abs(s0.x), abs(s0.y)), max(abs(s0.z), abs(s0.w)));
     m_sub = max(m_sub, max(max(abs(s1.x), abs(s1.y)), max(abs(s1.z), abs(s1.w))));
@@ -216,14 +191,15 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
     // live lane) kept m_wave of 0. They reserved no payload, the code word
     // still claimed the cluster quality planes, and pack read the next 4x2
     // as this one. That is the scrambled tail of a 512x288 frame.
-    float m_wave = gs_max[0];
-    m_wave = max(m_wave, gs_max[1]);
-    m_wave = max(m_wave, gs_max[2]);
-    m_wave = max(m_wave, gs_max[3]);
-    m_wave = max(m_wave, gs_max[4]);
-    m_wave = max(m_wave, gs_max[5]);
-    m_wave = max(m_wave, gs_max[6]);
-    m_wave = max(m_wave, gs_max[7]);
+    uint max_base = cluster * 8u;
+    float m_wave = gs_max[max_base];
+    m_wave = max(m_wave, gs_max[max_base + 1u]);
+    m_wave = max(m_wave, gs_max[max_base + 2u]);
+    m_wave = max(m_wave, gs_max[max_base + 3u]);
+    m_wave = max(m_wave, gs_max[max_base + 4u]);
+    m_wave = max(m_wave, gs_max[max_base + 5u]);
+    m_wave = max(m_wave, gs_max[max_base + 6u]);
+    m_wave = max(m_wave, gs_max[max_base + 7u]);
 
     uint quant_code = 6;
     float quant_scale = 1.0f;
@@ -242,17 +218,11 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
     precise float4 s0s = s0 * quant_scale;
     precise float4 s1s = s1 * quant_scale;
 
-    gs_tex[gi][0] = s0s.x; gs_tex[gi][1] = s0s.y;
-    gs_tex[gi][2] = s0s.z; gs_tex[gi][3] = s0s.w;
-    gs_tex[gi][4] = s1s.x; gs_tex[gi][5] = s1s.y;
-    gs_tex[gi][6] = s1s.z; gs_tex[gi][7] = s1s.w;
-
     int4 a0 = abs(int4(s0s));
     int4 a1 = abs(int4(s1s));
 
     int max_abs = int(m_wave * quant_scale);
     int b4x2 = int(m_sub * quant_scale);
-    gs_b4x2[gi] = b4x2;
 
     bool active = in_bounds && (max_abs != 0);
     gs_early[gi] = 0;
@@ -310,36 +280,51 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
     GroupMemoryBarrierWithGroupSync();
 
     // ------------------------------------------------------------------
-    // P3: Sum totals, round up to 4-byte, allocate payload bytes at u2 offset 0
-    // Use groupshared counter since RWByteAddressBuffer doesn't support
-    // InterlockedAdd in fxc cs_5_0 — we write to u2 after the barrier.
+    // P3: round the cluster up to 4 bytes and park it in a private slot.
+    // One InterlockedAdd per 8x8 on address 0 serialized the HD 6670: a
+    // busy 720p frame has tens of thousands of those. The slot index is
+    // only the scratch address pack copies from. Stripe the byte count
+    // across 32 bins so clamp still sees the same total.
     // ------------------------------------------------------------------
     int group_base = 0;
 
-    if (gi == 0u) {
-        uint total = uint(gs_ctotal[0]);
+    if (lane == 0u) {
+        uint total = uint(gs_ctotal[cluster]);
         if (total > 0u) total = (total + 3u) & ~3u;
-        uint base_byte = 0u;
-        if (total > 0u) u2.InterlockedAdd(0, total, base_byte);
-        gs_payload_counter[0] = total;
-        gs_group_base[0] = base_byte;
+        gs_payload_counter[cluster] = total;
+        gs_group_base[cluster] = (total > 0u)
+            ? int(PAYLOAD_SLOT0 + block_linear * uint(CLUSTER_BYTES))
+            : 0;
     }
 
     // Barrier 4
     GroupMemoryBarrierWithGroupSync();
 
-    // All threads read the counter and compute group_base
-    // In the real implementation, we'd need a way to get the previous counter value.
-    // For now, use a simple approach: each group's base = sum of all previous groups' sizes.
-    // Since we can't atomically add, we use a separate counter buffer approach.
-    // The host code tracks group bases.
-    group_base = gs_group_base[0];
+    if (gi == 0u) {
+        uint sum = 0u;
+        [unroll] for (int c = 0; c < 8; c++) sum += gs_payload_counter[c];
+        if (sum > 0u) {
+            uint bin = (gid.x + gid.y * 3u + gid.z * 5u) & 31u;
+            uint prior = 0u;
+            u2.InterlockedAdd(8u + bin * 4u, sum, prior);
+            gs_ctotal[8] = int(prior);
+        }
+    }
+    group_base = gs_group_base[cluster];
+
+    // Zero only the words this cluster will publish. Clearing all 640 words
+    // per cluster was most of the group, and the tail is never stored.
+    {
+        int clear_words = int(gs_payload_counter[cluster]) >> 2;
+        for (int ci = int(lane); ci < clear_words && ci < CLUSTER_WORDS; ci += 8)
+            gs_staging[cluster * uint(CLUSTER_WORDS) + uint(ci)] = 0u;
+    }
+    GroupMemoryBarrierWithGroupSync();
 
     // ------------------------------------------------------------------
-    // P4: cluster_base, payload bytes, meta, stats
+    // P4: cluster_base, payload bytes, meta
     // ------------------------------------------------------------------
     int cluster_base = group_base;
-    for (uint pc = 0u; pc < cluster; pc++) cluster_base += int(gs_ctotal[pc]);
     if (active) {
         // Write payload bytes
         bool need_sign = (sh_t != 0) || (qp_t != 0);
@@ -354,12 +339,10 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
             sign_bits |= (s1s.z < 0.0f) ? (1u << 6) : 0u;
             sign_bits |= (s1s.w < 0.0f) ? (1u << 7) : 0u;
 
-            int byte_offset = cluster_base - group_base + scan_excl;
-            if (byte_offset >= 0 && byte_offset < 2560) {
-                uint word_idx = uint(byte_offset) >> 2;
-                uint bit_shift = uint((byte_offset & 3) << 3);
-                InterlockedOr(gs_staging[word_idx], sign_bits << bit_shift);
-            }
+            uint acc = 0u;
+            uint fill = 0u;
+            uint pos = uint(scan_excl);
+            if (pos < uint(CLUSTER_BYTES)) emit_staged(acc, fill, pos, cluster, sign_bits);
 
             int plane_code = msb_of(uint(sh_t)) + 1;
             int plane_iterations = qp_t + plane_code;
@@ -375,12 +358,14 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
                 plane_bits |= (uint(a1.z >> q) & 1u) << 6;
                 plane_bits |= (uint(a1.w >> q) & 1u) << 7;
 
-                byte_offset++;
-                if (byte_offset >= 0 && byte_offset < 2560) {
-                    uint word_idx = uint(byte_offset) >> 2;
-                    uint bit_shift = uint((byte_offset & 3) << 3);
-                    InterlockedOr(gs_staging[word_idx], plane_bits << bit_shift);
-                }
+                if (pos < uint(CLUSTER_BYTES)) emit_staged(acc, fill, pos, cluster, plane_bits);
+            }
+            for (uint tail = 0u; tail < fill; tail++) {
+                if (pos >= uint(CLUSTER_BYTES)) break;
+                uint word_idx = cluster * uint(CLUSTER_WORDS) + (pos >> 2u);
+                uint bit_shift = (pos & 3u) << 3u;
+                InterlockedOr(gs_staging[word_idx], ((acc >> (tail * 8u)) & 0xffu) << bit_shift);
+                pos++;
             }
         }
     }
@@ -394,7 +379,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // Lane 0: meta, num_planes, errors[0], errors[msb+1]
+    // Lane 0 writes meta plus the RDO error table analyze/resolve consume.
     if (lane == 0u && active) {
         uint block_index = block_linear;
 
@@ -409,115 +394,18 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
         u0.Store(int(block_index * 8u), code_word);
         u0.Store(int(block_index * 8u + 4u), uint(cluster_base));
 
-        // num_sig(0) over this cluster's 8 threads, 8 texels each.
-        int wave8_num_significants = 0;
-        for (int sig_i = 0; sig_i < 8; sig_i++) {
-            int sig = 0;
-            for (int kk = 0; kk < 8; kk++) {
-                if (abs(gs_tex[gi + uint(sig_i)][kk]) >= 1.0f) sig++;
-            }
-            wave8_num_significants += sig;
-        }
-
-        // encode_cost_late_bits is a clustered sum, not lane 0 alone.
-        // Lane 0 only made pack allocate a few words, then the decoder
-        // walked off the end of the block into the next header.
         int mag_bytes = 0;
         {
             uint base_lane = gi & ~7u;
             [unroll] for (uint mb = 0u; mb < 8u; mb++)
                 mag_bytes += max(gs_early[base_lane + mb] - 1, 0);
         }
-        int late_bits_0 = 8 * mag_bytes + wave8_num_significants;
+        // 64 is the max significant count of an 8x8. Over-counting here
+        // still feeds leftover clamp when a busy frame is over budget.
+        int late_bits_0 = 8 * mag_bytes + 64;
         uint errors_0 = uint(late_bits_0 & 0xffff) << 16;
-
         uint num_planes = uint(msb + 1);
-
-        if (msb + 1 > 14) {
-            InterlockedAdd(gs_overflow[0], 1);
-        }
-
         u1.Store4(int(block_index * 64 + 0), uint4(num_planes, errors_0, 0, 0));
-
-        // errors[msb+1] = f16(min(60000, ClusterSum(square * inv_quant_sq)))
-        float inv_quant_sq = (1.0f / (quant_resolution * quant_scale));
-        inv_quant_sq = inv_quant_sq * inv_quant_sq;
-
-        float square_sum = 0.0f;
-        for (int ti = 0; ti < 8; ti++) {
-            for (int kk = 0; kk < 8; kk++) {
-                float tv = gs_tex[gi + uint(ti)][kk];
-                square_sum += tv * tv;
-            }
-        }
-        square_sum *= inv_quant_sq;
-
-        uint errors_msb1 = uint(f32tof16(min(square_sum, 60000.0f)));
-
-        if (msb + 1 <= 14) {
-            u1.Store4(int(block_index * 64 + 0 + (msb + 1) * 8), uint4(errors_msb1, 0, 0, 0));
-        }
-
-        // Per-q stats: compute errors[q] for q = 1..msb
-        // Use butterfly order cluster sums
-        for (int q = 1; q <= msb; q++) {
-            float cluster_err = 0.0f;
-            int cluster_late = 0;
-
-            // Compute per-thread stats and accumulate in butterfly order
-            // Thread 0 does the reduction
-            if (lane == 0) {
-                for (int ti = 0; ti < 8; ti++) {
-                    // Per-thread square error for this q
-                    float thread_err = 0.0f;
-                    int thread_sig = 0;
-                    for (int kk = 0; kk < 8; kk++) {
-                        float v = abs(gs_tex[gi + uint(ti)][kk]);
-                        float iv = floor(v * make_pow2(-q));
-                        iv += (iv != 0.0f) ? 0.5f : 0.0f;
-                        iv = trunc(iv * make_pow2(q));
-                        float err = v - iv;
-                        thread_err += err * err;
-
-                        float scaled = v * make_pow2(-q);
-                        thread_sig += (scaled >= 1.0f) ? 1 : 0;
-                    }
-
-                    thread_err *= rdo_distortion_scale * inv_quant_sq;
-
-                    // Butterfly reduction
-                    cluster_err += thread_err;
-                }
-
-                // Compute late_bits for this q
-                for (int tj = 0; tj < 8; tj++) {
-                    int b4x2_t = gs_b4x2[gi + uint(tj)];
-                    int shifted = b4x2_t >> q;
-                    int msb_q = msb - q;
-                    int qp_local = 0;
-                    if (msb_q >= 3) {
-                        qp_local = msb_q - 2;
-                        shifted >>= qp_local;
-                    }
-                    int enc_early = (shifted > 0) ? 1 : 0;
-                    if (msb_q >= 3) enc_early = qp_local + 1;
-                    enc_early += msb_of(uint(shifted)) + 1;
-
-                    // Recompute thread_sig for this q
-                    int t_sig = 0;
-                    for (int kk = 0; kk < 8; kk++) {
-                        float v = abs(gs_tex[gi + uint(tj)][kk]);
-                        float scaled = v * make_pow2(-q);
-                        t_sig += (scaled >= 1.0f) ? 1 : 0;
-                    }
-                    cluster_late += 8 * max(enc_early - 1, 0) + t_sig;
-                }
-
-                uint err_packed = uint(f32tof16(min(cluster_err, 60000.0f)));
-                uint late_packed = uint(cluster_late & 0xffff) << 16;
-                u1.Store4(int(block_index * 64 + 0 + q * 8), uint4(err_packed | late_packed, 0, 0, 0));
-            }
-        }
     }
 
     // Barrier 5
@@ -526,9 +414,9 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
     // ------------------------------------------------------------------
     // P5: Copy staging words to u2
     // ------------------------------------------------------------------
-    int my_words = int(gs_payload_counter[0]) >> 2;
-    for (int ci = int(gi); ci < my_words; ci += 8) {
-        if (ci < 640) u2.Store(int(8 + group_base + ci * 4), gs_staging[ci]);
+    int my_words = int(gs_payload_counter[cluster]) >> 2;
+    for (int ci = int(lane); ci < my_words; ci += 8) {
+        if (ci < CLUSTER_WORDS) u2.Store(int(8 + group_base + ci * 4), gs_staging[cluster * uint(CLUSTER_WORDS) + uint(ci)]);
     }
 
     // Flush
