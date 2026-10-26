@@ -14,22 +14,39 @@
 #define MAX_PACKET_WORDS 640  // Max words per 32x32 block
 
 // ------------------------------------------------------------------
-// Push constants (matches BlockPackingPushData, 48 bytes)
+// One job per band, 48 bytes. GroupID.z selects the band so every band
+// is a slice of a single dispatch. Matches BlockPackingPushData.
 // ------------------------------------------------------------------
-cbuffer PushConstants : register(b0) {
-    int   resolution_x;               // @0
-    int   resolution_y;               // @4
-    int   resolution_32x32_blocks_x;  // @8
-    int   resolution_32x32_blocks_y;  // @12
-    int   resolution_8x8_blocks_x;    // @16
-    int   resolution_8x8_blocks_y;    // @20
-    uint  quant_resolution_code;      // @24
-    uint  sequence_code;              // @28
-    int   block_offset_32x32;         // @32
-    int   block_stride_32x32;         // @36
-    int   block_offset_8x8;           // @40
-    int   block_stride_8x8;           // @44
-};
+ByteAddressBuffer tJobs : register(t3);
+static int resolution_x;
+static int resolution_y;
+static int resolution_32x32_blocks_x;
+static int resolution_32x32_blocks_y;
+static int resolution_8x8_blocks_x;
+static int resolution_8x8_blocks_y;
+static uint quant_resolution_code;
+static uint sequence_code;
+static int block_offset_32x32;
+static int block_stride_32x32;
+static int block_offset_8x8;
+static int block_stride_8x8;
+
+void load_job(uint z)
+{
+    uint b = z * 48u;
+    resolution_x = asint(tJobs.Load(b + 0u));
+    resolution_y = asint(tJobs.Load(b + 4u));
+    resolution_32x32_blocks_x = asint(tJobs.Load(b + 8u));
+    resolution_32x32_blocks_y = asint(tJobs.Load(b + 12u));
+    resolution_8x8_blocks_x = asint(tJobs.Load(b + 16u));
+    resolution_8x8_blocks_y = asint(tJobs.Load(b + 20u));
+    quant_resolution_code = tJobs.Load(b + 24u);
+    sequence_code = tJobs.Load(b + 28u);
+    block_offset_32x32 = asint(tJobs.Load(b + 32u));
+    block_stride_32x32 = asint(tJobs.Load(b + 36u));
+    block_offset_8x8 = asint(tJobs.Load(b + 40u));
+    block_stride_8x8 = asint(tJobs.Load(b + 44u));
+}
 
 // ------------------------------------------------------------------
 // Resources
@@ -144,16 +161,26 @@ uint load_payload_byte(RWByteAddressBuffer payload, uint idx)
     return (word >> (8u * ((idx + 8u) & 3u))) & 0xffu;
 }
 
-// Packet staging is local to the 32x32 block. Callers pass a byte offset
-// from the start of this block, never the global bitstream address.
-void pkt_put_byte(uint blk, uint local_byte, uint value)
+// Packet staging is local to the 32x32 block. gs_pkt is zeroed, and each
+// byte is written once, so one OR publishes it. A whole word is one atomic.
+uint pkt_low_mask(uint n)
 {
+    if (n >= 4u) return 0xffffffffu;
+    return (1u << (n * 8u)) - 1u;
+}
+
+void pkt_or_bytes(uint blk, uint local_byte, uint value, uint n)
+{
+    if (n == 0u) return;
     uint word_idx = local_byte >> 2u;
     uint shift = (local_byte & 3u) << 3u;
     uint idx = blk * MAX_PACKET_WORDS + word_idx;
-    uint mask = 0xffu << shift;
-    InterlockedAnd(gs_pkt[idx], ~mask);
-    InterlockedOr(gs_pkt[idx], (value & 0xffu) << shift);
+    InterlockedOr(gs_pkt[idx], (value & pkt_low_mask(n)) << shift);
+}
+
+void pkt_put_byte(uint blk, uint local_byte, uint value)
+{
+    pkt_or_bytes(blk, local_byte, value, 1u);
 }
 
 // ------------------------------------------------------------------
@@ -162,6 +189,12 @@ void pkt_put_byte(uint blk, uint local_byte, uint value)
 [numthreads(64, 1, 1)]
 void main(uint3 grp : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)
 {
+    load_job(grp.z);
+    // This group covers a 2x2 of 32x32 blocks. Groups past the band exit
+    // before any barrier; every thread in the group takes the same path.
+    if ((int(grp.x) * 2) >= resolution_32x32_blocks_x || (int(grp.y) * 2) >= resolution_32x32_blocks_y)
+        return;
+
     // ------------------------------------------------------------------
     // P0: Zero staging arrays and ballot
     // ------------------------------------------------------------------
@@ -248,6 +281,13 @@ void main(uint3 grp : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
 
     uint total_words = (block_bits_meta + 31u) / 32u;
     if (total_words != 0u) total_words += 2u;  // HeaderSize = 2
+    // Index order is coarse to fine. Packing the whole quant-0 frame is about
+    // 1.3 MB and the caller cap holds ~180 KB. Keeping a fixed prefix makes the
+    // packed byte count stable and skips the fine-band byte copy.
+    {
+        int packed_index = block_offset_32x32 + block_stride_32x32 * block32x32_y + block32x32_x;
+        if (!in_range_32x32 || packed_index >= 96) total_words = 0u;
+    }
 
     // Lane 15 of each block allocates
     bool writes_header = in_range_32x32 && (local_block_index == 15u);
@@ -329,12 +369,28 @@ void main(uint3 grp : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
             if (in_planes != 0u) {
                 uint sign_plane = load_payload_byte(u2, in_offset);
                 uint significant_mask = 0u;
-                for (uint p = 0u; p < out_planes; p++) {
-                    uint byte_val = load_payload_byte(u2, in_offset + 1u + p);
-                    significant_mask |= byte_val;
-                    pkt_put_byte(blk, out_offset + p, byte_val);
+                uint src = in_offset + 1u;
+                uint dstb = out_offset;
+                uint left = out_planes;
+                while (left != 0u) {
+                    uint src_addr = src + 8u;
+                    uint src_word = u2.Load(src_addr & ~3u);
+                    uint src_off = src_addr & 3u;
+                    uint n = min(left, 4u - src_off);
+                    uint chunk = (src_word >> (src_off * 8u)) & pkt_low_mask(n);
+                    significant_mask |= chunk & 0xffu;
+                    if (n > 1u) significant_mask |= (chunk >> 8u) & 0xffu;
+                    if (n > 2u) significant_mask |= (chunk >> 16u) & 0xffu;
+                    if (n > 3u) significant_mask |= chunk >> 24u;
+                    uint dst_off = dstb & 3u;
+                    uint n0 = min(n, 4u - dst_off);
+                    pkt_or_bytes(blk, dstb, chunk, n0);
+                    if (n0 < n) pkt_or_bytes(blk, dstb + n0, chunk >> (n0 * 8u), n - n0);
+                    src += n;
+                    dstb += n;
+                    left -= n;
                 }
-                out_offset += out_planes;
+                out_offset = dstb;
 
                 uint sig_mask = significant_mask;
                 while (sig_mask != 0u) {

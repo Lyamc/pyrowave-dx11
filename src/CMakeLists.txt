@@ -162,7 +162,21 @@ target_include_directories(test_t5b PRIVATE
 )
 target_link_libraries(test_t5b PRIVATE d3d11 dxgi d3dcompiler crypt32)
 target_sources(test_t5b PRIVATE device.cpp c_api.cpp debug_dump.cpp dwt.cpp frame.cpp quant.cpp analyze.cpp resolve.cpp)
+add_dependencies(test_t5b pyrowave_d3d11)
 set_target_properties(test_t5b PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+# Time encode_cpu + compute_num_packets + packetize on the shipped entry points.
+add_executable(bench_time tests/bench_time.cpp)
+target_include_directories(bench_time PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_BINARY_DIR}"
+)
+target_link_libraries(bench_time PRIVATE d3d11 dxgi d3dcompiler crypt32)
+target_sources(bench_time PRIVATE device.cpp c_api.cpp debug_dump.cpp dwt.cpp frame.cpp quant.cpp analyze.cpp resolve.cpp)
+add_dependencies(bench_time pyrowave_d3d11)
+set_target_properties(bench_time PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
 )
 

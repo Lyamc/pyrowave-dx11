@@ -27,21 +27,12 @@ using Microsoft::WRL::ComPtr;
 // Layout: int2 @0, int2 @8, float2 @16, float @24, float @28,
 //          int @32, int @36, float @40, pad to 48
 // ------------------------------------------------------------------
+// Matches quant.hlsl `uint4 w[10]` (160 bytes). Bands of one coefficient
+// buffer share w[0..1]; each band is two uint4s starting at w[2].
 struct QuantPushConstants {
-    int   resolution_x;           // @0
-    int   resolution_y;           // @4
-    int   resolution_8x8_blocks_x;// @8
-    int   resolution_8x8_blocks_y;// @12
-    float inv_resolution_x;       // @16
-    float inv_resolution_y;       // @20
-    float input_layer;            // @24
-    float quant_resolution;       // @28
-    int   block_offset;           // @32
-    int   block_stride;           // @36
-    float rdo_distortion_scale;   // @40
-    uint32_t coeff_pitch;         // @44
+    uint32_t w[40];
 };
-static_assert(sizeof(QuantPushConstants) == 48, "QuantPushConstants must be 48 bytes");
+static_assert(sizeof(QuantPushConstants) == 160, "QuantPushConstants must be 160 bytes");
 
 // ------------------------------------------------------------------
 // Helper: get quant resolution for a band (R/pyrowave_encoder.cpp:148-176)
@@ -181,6 +172,14 @@ pwd3d11_result quant_create_outputs(QuantState *st)
     st->total_blocks = total_blocks;
     if (total_blocks <= 0 || st->total_blocks_32 <= 0) return PWD3D11_ERROR_INVALID_ARGUMENT;
 
+    size_t payload = size_t(st->aw) * size_t(st->ah) * 8 + size_t(total_blocks) * 64 + 256;
+    payload = (payload + 15u) & ~size_t(15);
+    if (st->meta_buf && st->stats_buf && st->payload_buf && st->uav_payload && st->payload_size == payload) {
+        D3D11_BUFFER_DESC md = {};
+        st->meta_buf->GetDesc(&md);
+        if (md.ByteWidth == UINT(total_blocks * 8)) return PWD3D11_SUCCESS;
+    }
+
     // u0: BlockMeta (8 bytes per block)
     {
         D3D11_BUFFER_DESC bd = {};
@@ -227,8 +226,7 @@ pwd3d11_result quant_create_outputs(QuantState *st)
     }
 
     // u2: Payload buffer (AW*AH*2 + padding)
-    st->payload_size = size_t(st->aw) * size_t(st->ah) * 8 + size_t(total_blocks) * 64 + 256;
-    st->payload_size = (st->payload_size + 15u) & ~size_t(15);
+    st->payload_size = payload;
 
     {
         D3D11_BUFFER_DESC bd = {};
@@ -313,52 +311,87 @@ pwd3d11_result quant_run(QuantState *st)
     ID3D11UnorderedAccessView *nulluav[3] = {nullptr, nullptr, nullptr};
 
     ctx->CSSetShader(cs, nullptr, 0);
-    UINT zero[4] = {};
-    ctx->ClearUnorderedAccessViewUint(st->uav_payload.Get(), zero);
-    ctx->ClearUnorderedAccessViewUint(st->uav_meta.Get(), zero);
-    ctx->ClearUnorderedAccessViewUint(st->uav_stats.Get(), zero);
+    // Counters are cleared by the caller before this runs. Clearing the whole
+    // payload here measured as part of the quant dispatch.
 
-    for (auto &b : st->bands) {
-        int bw = b.w, bh = b.h;
-        if (bw <= 0 || bh <= 0) continue;
-        int bw_8 = (bw + 7) / 8;
-        int bh_8 = (bh + 7) / 8;
+    D3D11_BUFFER_DESC have_cb = {};
+    if (st->cb[0]) st->cb[0]->GetDesc(&have_cb);
+    if (!st->cb[0] || have_cb.ByteWidth < sizeof(QuantPushConstants)) {
+        D3D11_BUFFER_DESC cbd = {};
+        cbd.ByteWidth = sizeof(QuantPushConstants);
+        cbd.Usage = D3D11_USAGE_DEFAULT;
+        cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        for (int i = 0; i < 32; i++) {
+            st->cb[i].Reset();
+            HRESULT hr = st->device->CreateBuffer(&cbd, nullptr, &st->cb[i]);
+            if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
+        }
+    }
 
-        QuantPushConstants pc = {};
-        pc.resolution_x = bw;
-        pc.resolution_y = bh;
-        pc.resolution_8x8_blocks_x = (bw + 7) / 8;
-        pc.resolution_8x8_blocks_y = (bh + 7) / 8;
-        pc.inv_resolution_x = 1.0f / float(bw);
-        pc.inv_resolution_y = 1.0f / float(bh);
-        pc.input_layer = float(b.band);
-        pc.quant_resolution = get_quant_resolution(b.level, b.component, b.band, st->chroma);
-        pc.block_offset = b.block_offset_8;
-        pc.block_stride = b.block_stride_8;
-        pc.rdo_distortion_scale = get_rdo_distortion_scale(b.level, b.component, b.band, st->chroma);
-        pc.coeff_pitch = uint32_t(b.pitch);
+    struct QuantJob {
+        QuantPushConstants pc;
+        ID3D11ShaderResourceView *srv;
+        UINT gx, gy, gz;
+    };
+    std::vector<QuantJob> jobs;
+    for (size_t i = 0; i < st->bands.size();) {
+        const auto &b0 = st->bands[i];
+        if (b0.block_offset_32 >= 96 || b0.w <= 0 || b0.h <= 0) {
+            i++;
+            continue;
+        }
+        QuantJob job = {};
+        int bw = b0.w, bh = b0.h;
+        job.pc.w[0] = uint32_t(bw);
+        job.pc.w[1] = uint32_t(bh);
+        job.pc.w[2] = uint32_t((bw + 7) / 8);
+        job.pc.w[3] = uint32_t((bh + 7) / 8);
+        float ix = 1.0f / float(bw);
+        float iy = 1.0f / float(bh);
+        std::memcpy(&job.pc.w[4], &ix, 4);
+        std::memcpy(&job.pc.w[5], &iy, 4);
+        job.pc.w[6] = uint32_t(b0.pitch);
+        job.srv = b0.srv.Get();
+        job.gx = UINT((bw + 31) / 32);
+        job.gy = UINT((bh + 31) / 32);
+        uint32_t n = 0;
+        while (i < st->bands.size() && n < 4u) {
+            const auto &b = st->bands[i];
+            if (b.block_offset_32 >= 96 || b.w != bw || b.h != bh || b.srv.Get() != job.srv)
+                break;
+            uint32_t o = 8u + n * 8u;
+            job.pc.w[o + 0] = uint32_t(b.band);
+            float qres = get_quant_resolution(b.level, b.component, b.band, st->chroma);
+            std::memcpy(&job.pc.w[o + 1], &qres, 4);
+            job.pc.w[o + 2] = uint32_t(b.block_offset_8);
+            job.pc.w[o + 3] = uint32_t(b.block_stride_8);
+            float rdo = get_rdo_distortion_scale(b.level, b.component, b.band, st->chroma);
+            std::memcpy(&job.pc.w[o + 4], &rdo, 4);
+            n++;
+            i++;
+        }
+        job.pc.w[7] = n;
+        job.gz = n;
+        if (n > 0) jobs.push_back(job);
+    }
+    // Band constants are fixed for this resolution. Updating a constant buffer
+    // the previous dispatch still has bound is a stall, so write them once.
+    if (!st->cb_warm) {
+        for (size_t i = 0; i < jobs.size(); i++)
+            ctx->UpdateSubresource(st->cb[i].Get(), 0, nullptr, &jobs[i].pc, 0, 0);
+        st->cb_warm = 1;
+    }
 
-        // Create cbuffer
-        ComPtr<ID3D11Buffer> cb;
-        D3D11_BUFFER_DESC bd = {};
-        bd.ByteWidth = sizeof(QuantPushConstants);
-        bd.Usage = D3D11_USAGE_IMMUTABLE;
-        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        D3D11_SUBRESOURCE_DATA sd = { &pc, 0, 0 };
-        HRESULT hr = st->device->CreateBuffer(&bd, &sd, &cb);
-        if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
-
-        ctx->CSSetConstantBuffers(0, 1, cb.GetAddressOf());
-        ctx->CSSetShaderResources(0, 1, b.srv.GetAddressOf());
-        ID3D11UnorderedAccessView *uavs[3] = { st->uav_meta.Get(), st->uav_stats.Get(), st->uav_payload.Get() };
-        ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
-
-        ctx->Dispatch(UINT(bw_8), UINT(bh_8), 1);
+    ID3D11UnorderedAccessView *uavs[3] = { st->uav_meta.Get(), st->uav_stats.Get(), st->uav_payload.Get() };
+    ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
+    for (size_t i = 0; i < jobs.size(); i++) {
+        ctx->CSSetConstantBuffers(0, 1, st->cb[i].GetAddressOf());
+        ctx->CSSetShaderResources(0, 1, &jobs[i].srv);
+        ctx->Dispatch(jobs[i].gx, jobs[i].gy, jobs[i].gz);
     }
 
     ctx->CSSetShaderResources(0, 1, &nullsrv);
     ctx->CSSetUnorderedAccessViews(0, 3, nulluav, nullptr);
-    ctx->Flush();
 
     return PWD3D11_SUCCESS;
 }

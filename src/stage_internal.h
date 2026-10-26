@@ -61,6 +61,10 @@ struct DWTState {
     ComPtr<ID3D11Buffer> scratch;
     ComPtr<ID3D11UnorderedAccessView> scratch_uav;
     uint32_t scratch_floats = 0;
+    ComPtr<ID3D11Buffer> cb[32];
+    // Up to three 64-byte level records for one fused dispatch.
+    ComPtr<ID3D11Buffer> batch_cb[16];
+    int batch_warm = 0;
 };
 
 // ------------------------------------------------------------------
@@ -94,6 +98,8 @@ struct QuantState {
     ComPtr<ID3D11UnorderedAccessView> uav_stats;
     ComPtr<ID3D11Buffer> payload_buf;
     ComPtr<ID3D11UnorderedAccessView> uav_payload;
+    ComPtr<ID3D11Buffer> cb[32];
+    int cb_warm = 0;
 };
 
 // ------------------------------------------------------------------
@@ -153,6 +159,13 @@ struct pwd3d11_encoder_t {
     ComPtr<ID3D11UnorderedAccessView> uav_payload;
     ComPtr<ID3D11Buffer> meta_buf;
     ComPtr<ID3D11UnorderedAccessView> uav_meta;
+    ComPtr<ID3D11Buffer> staging;
+    ComPtr<ID3D11Buffer> pack_cb[32];
+    ComPtr<ID3D11Buffer> pack_jobs;
+    ComPtr<ID3D11ShaderResourceView> pack_srv_jobs;
+    ComPtr<ID3D11ShaderResourceView> pack_srv_meta;
+    ComPtr<ID3D11ShaderResourceView> pack_srv_stats;
+    ComPtr<ID3D11ShaderResourceView> pack_srv_quant;
 
     size_t bitstream_size = 0;
     size_t meta_size = 0;
@@ -162,6 +175,7 @@ struct pwd3d11_encoder_t {
     unsigned int sequence_code;
     float timings[10];
     size_t timing_count = 0;
+    int clears_done = 0;
 };
 
 #endif /* STAGE_INTERNAL_H */

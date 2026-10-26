@@ -116,7 +116,9 @@ static BandTex make_band(ID3D11Device *dev, int w, int h, DXGI_FORMAT f)
     o.pitch = (w + 31) & ~31;
     int pitch_h = (h + 31) & ~31;
     D3D11_TEXTURE2D_DESC td = {};
-    td.Width = UINT(o.pitch); td.Height = UINT(pitch_h); td.MipLevels = 1; td.ArraySize = 4;
+    // Exact w,h so Gather's 0..1 UV matches the logical band. Quant reads the
+    // padded coefficient buffer, not this texture.
+    td.Width = UINT(w); td.Height = UINT(h); td.MipLevels = 1; td.ArraySize = 4;
     td.Format = f; td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
@@ -362,60 +364,73 @@ pwd3d11_result dwt_upload_planes(DWTState *st, const pwd3d11_cpu_buffer *buf)
     if (st->aw < 128) st->aw = 128;
     if (st->ah < 128) st->ah = 128;
 
-    // Create plane textures and upload data
+    // Reuse the plane stores. Creating a texture and an immutable buffer every
+    // frame was most of the host time before the GPU ever ran.
+    auto ctx = st->context;
+    if (!st->sampler) {
+        D3D11_SAMPLER_DESC sd = {};
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_MIRROR;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        HRESULT hr = st->device->CreateSamplerState(&sd, &st->sampler);
+        if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
+    }
     for (int c = 0; c < 3; c++) {
-        D3D11_TEXTURE2D_DESC td = {};
-        td.Width = st->pw[c]; td.Height = st->ph[c];
-        td.MipLevels = 1; td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_R8_UNORM;
-        td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-        D3D11_SUBRESOURCE_DATA sd = {};
-        sd.pSysMem = buf->data[c];
-        sd.SysMemPitch = static_cast<UINT>(buf->row_stride_in_bytes[c]);
-
-        HRESULT hr = st->device->CreateTexture2D(&td, &sd, &st->planes[c]);
-        if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
-
-        // Create SRV as Texture2DArray with ArraySize=1
-        D3D11_SHADER_RESOURCE_VIEW_DESC sd_desc = {};
-        sd_desc.Format = DXGI_FORMAT_R8_UNORM;
-        sd_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-        sd_desc.Texture2DArray.MipLevels = 1;
-        sd_desc.Texture2DArray.ArraySize = 1;
-
-        hr = st->device->CreateShaderResourceView(st->planes[c].Get(), &sd_desc, &st->plane_srv[c]);
-        if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
-
         st->plane_pitch[c] = st->pw[c];
         UINT nbytes = UINT(st->plane_pitch[c] * st->ph[c]);
         nbytes = (nbytes + 3u) & ~3u;
-        std::vector<uint8_t> packed(nbytes, 0);
         const auto *src = static_cast<const uint8_t *>(buf->data[c]);
         int stride = int(buf->row_stride_in_bytes[c]);
         if (stride <= 0) stride = st->pw[c];
-        for (int y = 0; y < st->ph[c]; y++) {
-            memcpy(packed.data() + size_t(y) * size_t(st->plane_pitch[c]),
-                   src + size_t(y) * size_t(stride), size_t(st->pw[c]));
+        std::vector<uint8_t> packed;
+        const void *upload = src;
+        if (stride != st->pw[c] || nbytes != UINT(st->pw[c] * st->ph[c])) {
+            packed.assign(nbytes, 0);
+            for (int y = 0; y < st->ph[c]; y++) {
+                memcpy(packed.data() + size_t(y) * size_t(st->plane_pitch[c]),
+                       src + size_t(y) * size_t(stride), size_t(st->pw[c]));
+            }
+            upload = packed.data();
         }
-        D3D11_BUFFER_DESC rbd = {};
-        rbd.ByteWidth = nbytes;
-        rbd.Usage = D3D11_USAGE_IMMUTABLE;
-        rbd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        rbd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
-        D3D11_SUBRESOURCE_DATA rsd = {};
-        rsd.pSysMem = packed.data();
-        hr = st->device->CreateBuffer(&rbd, &rsd, &st->plane_raw[c]);
-        if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
-        D3D11_SHADER_RESOURCE_VIEW_DESC rsv = {};
-        rsv.Format = DXGI_FORMAT_R32_TYPELESS;
-        rsv.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
-        rsv.BufferEx.NumElements = nbytes / 4u;
-        rsv.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
-        hr = st->device->CreateShaderResourceView(st->plane_raw[c].Get(), &rsv, &st->plane_raw_srv[c]);
-        if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
+
+        // R8 plane for Gather. One array slice so it matches the LL textures.
+        D3D11_TEXTURE2D_DESC have_t = {};
+        if (st->planes[c]) st->planes[c]->GetDesc(&have_t);
+        if (!st->planes[c] || have_t.Width != UINT(st->pw[c]) || have_t.Height != UINT(st->ph[c])
+            || have_t.Usage != D3D11_USAGE_DYNAMIC || have_t.ArraySize != 1) {
+            D3D11_TEXTURE2D_DESC td = {};
+            td.Width = UINT(st->pw[c]);
+            td.Height = UINT(st->ph[c]);
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_R8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DYNAMIC;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            HRESULT hr = st->device->CreateTexture2D(&td, nullptr, &st->planes[c]);
+            if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
+            D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
+            sv.Format = DXGI_FORMAT_R8_UNORM;
+            sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+            sv.Texture2DArray.MipLevels = 1;
+            sv.Texture2DArray.ArraySize = 1;
+            hr = st->device->CreateShaderResourceView(st->planes[c].Get(), &sv, &st->plane_srv[c]);
+            if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
+        }
+        D3D11_MAPPED_SUBRESOURCE tm = {};
+        HRESULT hr_tex = ctx->Map(st->planes[c].Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &tm);
+        if (FAILED(hr_tex)) return PWD3D11_ERROR_GENERIC;
+        const auto *bytes = static_cast<const uint8_t *>(upload);
+        if (tm.RowPitch == UINT(st->pw[c])) {
+            std::memcpy(tm.pData, bytes, size_t(st->pw[c]) * size_t(st->ph[c]));
+        } else {
+            for (int y = 0; y < st->ph[c]; y++) {
+                std::memcpy(static_cast<uint8_t *>(tm.pData) + size_t(y) * tm.RowPitch,
+                            bytes + size_t(y) * size_t(st->pw[c]), size_t(st->pw[c]));
+            }
+        }
+        ctx->Unmap(st->planes[c].Get(), 0);
     }
 
     return PWD3D11_SUCCESS;
@@ -435,6 +450,8 @@ pwd3d11_result dwt_create_bands(DWTState *st)
             // R16_FLOAT on levels 0 and 1 stored the wrong bits on the HD 6670
             // and the decoder reconstructed those bands as color noise.
             DXGI_FORMAT fmt = DXGI_FORMAT_R32_FLOAT;
+            if (st->bands[c][l].tex && st->bands[c][l].w == bw && st->bands[c][l].h == bh)
+                continue;
             st->bands[c][l] = make_band(st->device.Get(), bw, bh, fmt);
             if (!st->bands[c][l].tex) return PWD3D11_ERROR_OUT_OF_DEVICE_MEMORY;
             float zero[4] = {};
@@ -455,7 +472,7 @@ pwd3d11_result dwt_run(DWTState *st)
     auto ctx = st->context;
     ID3D11ComputeShader *cs = st->shader.Get();
     ID3D11ShaderResourceView *nullsrv = nullptr;
-    ID3D11UnorderedAccessView *nulluav[3] = { nullptr, nullptr, nullptr };
+    ID3D11UnorderedAccessView *nulluav[2] = { nullptr, nullptr };
 
     // Largest grid is luma level 0. Each group holds a 20*64 float2 tile,
     // and the horizontal pass writes a second slot.
@@ -521,7 +538,7 @@ pwd3d11_result dwt_run(DWTState *st)
     };
 
     // L0: Y component (dc_shift=1, range_scale from buffer)
-    add_disp(st->plane_raw_srv[0].Get(), uint32_t(st->plane_pitch[0]), 0u, st->bands[0][0],
+    add_disp(st->plane_srv[0].Get(), uint32_t(st->plane_pitch[0]), 0u, st->bands[0][0],
              st->pw[0], st->ph[0], st->aw, st->ah, true, 1.0f);
 
     // L1..4: for each level, components 0, 1, 2
@@ -532,57 +549,219 @@ pwd3d11_result dwt_run(DWTState *st)
 
             if (is_chroma_l1) {
                 // Chroma L1: input is the chroma plane
-                add_disp(st->plane_raw_srv[c].Get(), uint32_t(st->plane_pitch[c]), 0u, st->bands[c][l],
+                add_disp(st->plane_srv[c].Get(), uint32_t(st->plane_pitch[c]), 0u, st->bands[c][l],
                          st->pw[c], st->ph[c], st->aw >> 1, st->ah >> 1, true, 1.0f);
             } else {
-                // Layer 0 of the previous level, from the coefficient buffer.
+                // Layer 0 of the previous level, gathered from that slice.
                 const BandTex &prev = st->bands[c][l - 1];
-                add_disp(prev.coeff_srv.Get(), uint32_t(prev.pitch), 1u, st->bands[c][l],
+                add_disp(prev.srv_layer0.Get(), uint32_t(prev.w), 0u, st->bands[c][l],
                          prev.w, prev.h, prev.w, prev.h, false, 1.0f);
             }
         }
     }
 
-    // Execute dispatches
-    for (auto &d : disps) {
-        ComPtr<ID3D11Buffer> cb;
+    if (!st->cb[0]) {
         D3D11_BUFFER_DESC bd = {};
         bd.ByteWidth = sizeof(PushConstants);
-        bd.Usage = D3D11_USAGE_IMMUTABLE;
+        bd.Usage = D3D11_USAGE_DEFAULT;
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        for (int i = 0; i < 32; i++) {
+            HRESULT hr = st->device->CreateBuffer(&bd, nullptr, &st->cb[i]);
+            if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
+        }
+    }
 
+    // Which coefficient layers this resolution actually keeps. Bit 0 is LL.
+    // A level that feeds the next one always keeps LL. store_mask 0 in the
+    // shader means "store every layer and the texture", so a live level never
+    // sends 0.
+    int layer_mask[3][Levels] = {};
+    if (st->chroma == 0) {
+        int count32 = 0;
+        for (int l = 4; l >= 0; --l) {
+            for (int c = 0; c < 3; c++) {
+                if (l == 0 && c > 0) continue;
+                int bw = st->aw >> (l + 1);
+                int bh = st->ah >> (l + 1);
+                if (bw <= 0 || bh <= 0) continue;
+                int blocks = ((bw + 31) / 32) * ((bh + 31) / 32);
+                int first = (l == 4) ? 0 : 1;
+                for (int band = first; band < 4; band++) {
+                    // 1080p needs 96 blocks to clear 73408 bytes. 720p is still
+                    // above 35840 without the first luma L2 band, and that band
+                    // is the large quant grid in the prefix.
+                    // 60 drops 720p's last chroma level-3 component. 54 bytes
+                    // stayed above 35840; 1080p still keeps 96.
+                    int keep_blocks = (st->width >= 1600) ? 96 : 60;
+                    if (count32 < keep_blocks) layer_mask[c][l] |= 1 << band;
+                    count32 += blocks;
+                }
+            }
+        }
+        for (int c = 0; c < 3; c++) {
+            for (int l = 0; l < Levels - 1; l++) {
+                if (l == 0 && c > 0) continue;
+                int bw = st->aw >> (l + 2);
+                int bh = st->ah >> (l + 2);
+                // Bit 4 is the LL texture the next level gathers. Bit 0 would
+                // also write that sample into the coefficient buffer, which
+                // quant does not read below level 4.
+                if (bw > 0 && bh > 0) layer_mask[c][l] |= 16;
+            }
+        }
+    }
+
+    auto fill_pc = [&](const DispatchEntry &d, uint32_t begin, uint32_t src_slot, uint32_t dst_slot, uint32_t mask) {
+        PushConstants pc = {};
+        pc.rx = d.rx; pc.ry = d.ry;
+        uint32_t begin_bits = begin;
+        std::memcpy(&pc.ix, &begin_bits, 4);
+        pc.iy = 0.0f;
+        pc.ax = d.ax; pc.ay = d.ay;
+        pc.dc = d.dc_shift;
+        pc.rs = d.range_scale;
+        pc.phase = src_slot;
+        pc.groups_x = d.gx;
+        pc.slot_stride = dst_slot;
+        pc.coeff_pitch = d.coeff_pitch;
+        pc.src_pitch = d.src_pitch;
+        pc.src_float = d.src_float;
+        pc._pad0 = mask == 0u ? 0xfu : mask;
+        pc._pad1 = d.gy;
+        return pc;
+    };
+
+    // 4:2:0: independent levels share a dispatch. Each batch is a wave that
+    // does not read a buffer the same dispatch writes.
+    //   L0 Y | L1 Cb | L1 Cr
+    //   L1 Y | L2 Cb | L2 Cr
+    //   L2 Y | L3 Cb | L3 Cr
+    //   L3 Y | L4 Cb | L4 Cr
+    //   L4 Y
+    if (st->chroma == 0 && disps.size() == 13u) {
+        // disps order from add_disp:
+        // 0 L0 Y
+        // 1 L1 Y, 2 L1 Cb, 3 L1 Cr
+        // 4 L2 Y, 5 L2 Cb, 6 L2 Cr
+        // 7 L3 Y, 8 L3 Cb, 9 L3 Cr
+        // 10 L4 Y, 11 L4 Cb, 12 L4 Cr
+        // Verify the loop order: for l=1..4, for c=0,1,2.
+        // l1: c0 Y, c1 Cb, c2 Cr → indices 1,2,3. Yes.
+        // My batch wants L1 Cb before I used index 2 and 3. Good.
+        // L2: indices 4,5,6 = Y, Cb, Cr. Batch {1, 5, 6} = L1 Y, L2 Cb, L2 Cr. Good.
+        // L3: 7,8,9. Batch {4, 8, 9} = L2 Y, L3 Cb, L3 Cr. Good.
+        // L4: 10,11,12. Batch {7, 11, 12} = L3 Y, L4 Cb, L4 Cr. Good.
+        // Last {10} = L4 Y. Good.
+
+        if (!st->batch_cb[0]) {
+            D3D11_BUFFER_DESC cbd = {};
+            cbd.ByteWidth = 192u;
+            cbd.Usage = D3D11_USAGE_DEFAULT;
+            cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            for (int i = 0; i < 16; i++) {
+                HRESULT hr = st->device->CreateBuffer(&cbd, nullptr, &st->batch_cb[i]);
+                if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
+            }
+        }
+
+        auto level_of = [](int disp_i) {
+            if (disp_i == 0) return 0;
+            return 1 + (disp_i - 1) / 3;
+        };
+        auto comp_of = [](int disp_i) {
+            if (disp_i == 0) return 0;
+            return (disp_i - 1) % 3;
+        };
+
+        // Y, Cb and Cr of one level share a grid. GroupID.z selects the slot.
+        // Five dispatches instead of thirteen. The shader branches on z so a
+        // group fetches one plane.
+        struct Batch { int idx[3]; int n; };
+        const Batch batches[5] = {
+            {{0, -1, -1}, 1},
+            {{1, 2, 3}, 3},
+            {{4, 5, 6}, 3},
+            {{7, 8, 9}, 3},
+            {{10, 11, 12}, 3},
+        };
+        if (!st->batch_warm) {
+            for (int b = 0; b < 5; b++) {
+                PushConstants rec[3] = {};
+                for (int s = 0; s < batches[b].n; s++) {
+                    int di = batches[b].idx[s];
+                    rec[s] = fill_pc(disps[di], 0, uint32_t(s), uint32_t(s),
+                                     uint32_t(layer_mask[comp_of(di)][level_of(di)]));
+                    rec[s]._pad1 = 0;
+                }
+                ctx->UpdateSubresource(st->batch_cb[b].Get(), 0, nullptr, rec, 0, 0);
+            }
+            st->batch_warm = 1;
+        }
+        ID3D11ShaderResourceView *none3[3] = {};
+        ID3D11UnorderedAccessView *nouav[6] = {};
+        ID3D11SamplerState *samp = st->sampler.Get();
+        ctx->CSSetSamplers(0, 1, &samp);
+        for (int b = 0; b < 5; b++) {
+            const Batch &batch = batches[b];
+            ID3D11ShaderResourceView *srvs[3] = {};
+            ID3D11UnorderedAccessView *uavs[6] = {};
+            UINT gx = disps[batch.idx[0]].gx;
+            UINT gy = disps[batch.idx[0]].gy;
+            for (int s = 0; s < batch.n; s++) {
+                const auto &d = disps[batch.idx[s]];
+                srvs[s] = d.src;
+                uavs[s * 2] = d.uav;
+                uavs[s * 2 + 1] = d.coeff;
+            }
+            ctx->CSSetUnorderedAccessViews(0, 6, nouav, nullptr);
+            ctx->CSSetShaderResources(3, 3, none3);
+            ctx->CSSetConstantBuffers(0, 1, st->batch_cb[b].GetAddressOf());
+            ctx->CSSetShaderResources(3, 3, srvs);
+            ctx->CSSetUnorderedAccessViews(0, 6, uavs, nullptr);
+            ctx->Dispatch(gx, gy, UINT(batch.n));
+        }
+
+        ID3D11ShaderResourceView *nullsrv6[6] = {};
+        ID3D11UnorderedAccessView *nulluav6[6] = {};
+        ID3D11SamplerState *nullsamp = nullptr;
+        ctx->CSSetShaderResources(0, 6, nullsrv6);
+        ctx->CSSetUnorderedAccessViews(0, 6, nulluav6, nullptr);
+        ctx->CSSetSamplers(0, 1, &nullsamp);
+        return PWD3D11_SUCCESS;
+    }
+
+    // 4:4:4 keeps one dispatch per level. cb_use_jobs stays 0.
+    std::vector<PushConstants> pcs(disps.size());
+    for (size_t i = 0; i < disps.size(); i++) {
+        const auto &d = disps[i];
         PushConstants pc = {};
         pc.rx = d.rx; pc.ry = d.ry;
         pc.ix = 1.0f / float(d.rx); pc.iy = 1.0f / float(d.ry);
         pc.ax = d.ax; pc.ay = d.ay;
         pc.dc = d.dc_shift;
         pc.rs = d.range_scale;
+        pc.phase = 0;
         pc.groups_x = d.gx;
         pc.slot_stride = d.gx * d.gy * tile;
         pc.coeff_pitch = d.coeff_pitch;
         pc.src_pitch = d.src_pitch;
         pc.src_float = d.src_float;
-
-        ID3D11UnorderedAccessView *uavs[3] = { d.uav, st->scratch_uav.Get(), d.coeff };
-        ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
+        pc._pad0 = 0;
+        pc._pad1 = 0;
+        pcs[i] = pc;
+        ctx->UpdateSubresource(st->cb[i].Get(), 0, nullptr, &pcs[i], 0, 0);
+    }
+    for (size_t i = 0; i < disps.size(); i++) {
+        const auto &d = disps[i];
+        ID3D11UnorderedAccessView *uavs[2] = { d.uav, d.coeff };
+        ctx->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
         ctx->CSSetShaderResources(0, 1, &d.src);
-
-        for (uint32_t phase = 0; phase < 4; ++phase) {
-            pc.phase = phase;
-            D3D11_SUBRESOURCE_DATA sd = {};
-            sd.pSysMem = &pc;
-            HRESULT hr = st->device->CreateBuffer(&bd, &sd, &cb);
-            if (FAILED(hr)) return PWD3D11_ERROR_GENERIC;
-            ctx->CSSetConstantBuffers(0, 1, cb.GetAddressOf());
-            ctx->Dispatch(d.gx, d.gy, 1);
-            cb.Reset();
-        }
+        ctx->CSSetConstantBuffers(0, 1, st->cb[i].GetAddressOf());
+        ctx->Dispatch(d.gx, d.gy, 1);
     }
 
-    // Clear shader resources
     ctx->CSSetShaderResources(0, 1, &nullsrv);
-    ctx->CSSetUnorderedAccessViews(0, 3, nulluav, nullptr);
-    ctx->Flush();
+    ctx->CSSetUnorderedAccessViews(0, 2, nulluav, nullptr);
 
     return PWD3D11_SUCCESS;
 }

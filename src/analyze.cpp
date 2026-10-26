@@ -62,6 +62,8 @@ pwd3d11_result analyze_set_stats(AnalyzeState *st, ID3D11Buffer *stats_buffer,
                                   int count_8x8, int count_32x32)
 {
     if (!stats_buffer || !st || count_8x8 <= 0 || count_32x32 <= 0) return PWD3D11_ERROR_INVALID_ARGUMENT;
+    if (st->srv_stats && st->stats_buf.Get() == stats_buffer && st->total_blocks_32x32 == count_32x32)
+        return PWD3D11_SUCCESS;
 
     st->stats_buf = stats_buffer;
     st->total_blocks_32x32 = count_32x32;
@@ -81,6 +83,11 @@ pwd3d11_result analyze_set_stats(AnalyzeState *st, ID3D11Buffer *stats_buffer,
 pwd3d11_result analyze_create_buffers(AnalyzeState *st)
 {
     if (!st->device) return PWD3D11_ERROR_INVALID_ARGUMENT;
+    if (st->quant_buf && st->uav_quant && st->bucket_buf && st->total_blocks_32x32 > 0) {
+        D3D11_BUFFER_DESC have = {};
+        st->quant_buf->GetDesc(&have);
+        if (have.ByteWidth == UINT(st->total_blocks_32x32 * 4)) return PWD3D11_SUCCESS;
+    }
 
     // per_sub = next_pow2(align(block_count_32x32, 16) / 16)
     int aligned_blocks = (st->total_blocks_32x32 + 15) & ~15;
