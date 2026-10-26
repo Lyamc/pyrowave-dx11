@@ -114,3 +114,49 @@ A later DLL on the same HD 6670 is 358,400 bytes. It encodes at the 4 bit-per-pi
 After warmup, a desktop frame spends about 0.6 ms uploading, 3.8 ms in the wavelet, 1.5 ms quantising, and 8.9 ms packing. The gradient pack is about 4.3 ms.
 
 `libpyrowave-shared` 1.0.0 decoded the four records that fit. A live 1280×720 desktop asked for 60 fps and held about 44–48 fps, near 45 Mbit/s. The 98 fps figure in the 2026-10-20 table is encode-only on the smaller quant-0 bitstream. It is not this live rate.
+
+## HYTE, 2026-10-26
+
+CPU (lavapipe), OpenGL, the quant-0 prefix D3D11 encoder, and Vulkan on HYTE (192.168.0.30): Windows 10.0.26200, Intel Core i9-13900K (32 logical processors), 96 GB, NVIDIA GeForce RTX 3060 plus Intel UHD Graphics 770.
+
+The D3D11 column is branch `quant0-prefix` at `2c5f8f6`, DLL `C:\Build\codecs\pwdx-bench\build\pyrowave_d3d11.dll`. That build keeps 60 blocks when the width is under 1600 and 96 blocks at 1080p. Tag v0.1.3, measured in the section above, is a different encoder.
+
+| Encoder | Binary |
+|---|---|
+| lavapipe and Vulkan | `C:\Program Files\etherquic\libpyrowave-shared-1.dll` (SHA-256 prefix `23F78ED66B0B399B`) |
+| lavapipe driver | `C:\Program Files\etherquic\vulkan-cpu\vulkan_lvp.dll`, `LP_NATIVE_VECTOR_WIDTH=512`. Device string `llvmpipe (LLVM 23.1.2, 512 bits)` |
+| Vulkan device | system `vulkan-1.dll`, vendor `0x10DE` |
+| OpenGL | pyrowave-gl `gl/src/cmp_bench.cpp`. WGL 4.3 core, renderer `NVIDIA GeForce RTX 3060/PCIe/SSE2` |
+
+`tools/pwcmpbench.cpp` timed lavapipe, Vulkan, and D3D11. OpenGL used the same frame, cap, warmup, and 50 ms sampler. `QueryPerformanceCounter` covers `encode_cpu`, `compute_num_packets`, and `packetize`.
+
+- Synthetic I420 from `prototype/pwbench.cpp`. 4:2:0. 1280×720 and 1920×1080.
+- Rate cap `max(W*H*3/16, 32 KiB)`: 172,800 and 388,800 bytes.
+- 20 warmup frames, then both 200 frames and 5 seconds. This run set `PWCMP_MAX_FRAMES=30000` so the fast GPU paths reached 5 seconds. The OpenGL bench has that cap in source and packetizes into 64 MiB, because its pyramid is larger than the cap plus 1 MiB. The other three packetize into cap plus 1 MiB.
+- CPU percent is process time divided by wall time, divided by 32. One-core is that figure before the divide.
+
+### 1280×720
+
+| Encoder | Frames | Latency ms min / avg / max / std | CPU % min / avg / max / std | Working set MiB min / avg / max / std | Output bytes |
+|---|---|---|---|---|---|
+| lavapipe | 231 | 19.76 / 21.69 / 24.64 / 0.86 | 6.3 / 23.5 / 45.5 / 7.8 | 101.1 / 101.1 / 101.1 / 0.0 | 172,740 |
+| Vulkan RTX 3060 | 9,337 | 0.42 / 0.54 / 2.68 / 0.15 | 0.0 / 1.4 / 3.9 / 0.9 | 198.2 / 198.6 / 198.7 / 0.1 | 172,760 |
+| OpenGL RTX 3060 | 1,897 | 2.53 / 2.64 / 3.84 / 0.11 | 3.2 / 5.8 / 6.5 / 0.7 | 178.0 / 178.7 / 178.7 / 0.1 | 1,324,828 |
+| D3D11 prefix | 14,764 | 0.27 / 0.34 / 2.10 / 0.12 | 1.6 / 4.3 / 6.2 / 1.0 | 45.6 / 45.7 / 45.7 / 0.0 | 41,988 |
+
+Average one-core CPU (100 = one full thread): lavapipe 752, Vulkan 45, OpenGL 187, D3D11 138.
+
+### 1920×1080
+
+| Encoder | Frames | Latency ms min / avg / max / std | CPU % min / avg / max / std | Working set MiB min / avg / max / std | Output bytes |
+|---|---|---|---|---|---|
+| lavapipe | 200 | 30.55 / 33.54 / 36.47 / 1.05 | 6.3 / 27.3 / 49.5 / 8.6 | 117.5 / 117.6 / 118.6 / 0.1 | 388,720 |
+| Vulkan RTX 3060 | 5,707 | 0.74 / 0.88 / 3.05 / 0.17 | 0.0 / 1.1 / 2.9 / 1.0 | 203.7 / 204.0 / 204.1 / 0.1 | 388,676 |
+| OpenGL RTX 3060 | 1,194 | 3.99 / 4.19 / 4.93 / 0.14 | 3.3 / 5.7 / 7.8 / 0.7 | 231.8 / 231.9 / 232.8 / 0.3 | 2,831,224 |
+| D3D11 prefix | 9,289 | 0.42 / 0.54 / 3.02 / 0.19 | 1.6 / 4.0 / 6.2 / 0.9 | 50.7 / 50.8 / 50.8 / 0.0 | 79,964 |
+
+Average one-core CPU: lavapipe 874, Vulkan 36, OpenGL 184, D3D11 128.
+
+Private bytes, average MiB: lavapipe 110.4 and 132.4, Vulkan 264.5 and 294.0, OpenGL 265.5 and 421.2, D3D11 105.7 and 166.1. Those figures are host memory.
+
+Lavapipe and Vulkan fill the cap, within a few dozen bytes of the 2026-10-20 sizes. The prefix D3D11 stream is 41,988 and 79,964 bytes. OpenGL's whole quant-0 pyramid is 1,324,828 and 2,831,224 bytes. On this GPU the prefix encode averages 0.34 ms and 0.54 ms. Vulkan averages 0.54 ms and 0.88 ms. OpenGL averages 2.64 ms and 4.19 ms. Lavapipe averages 21.69 ms and 33.54 ms.
