@@ -321,14 +321,20 @@ void main(uint3 grp : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_Gr
     // ------------------------------------------------------------------
     // P3: Header words, code word, q byte, planes and signs into gs_pkt
     // ------------------------------------------------------------------
-    // Lane 15 writes header (words 0 and 1)
+    // Lane 15 writes header (words 0 and 1). An in-range block with no words
+    // still publishes num_words 0 so a previous frame cannot leak through.
+    int block_index = block_offset_32x32 + block_stride_32x32 * block32x32_y + block32x32_x;
+    if (writes_header && total_words == 0u) {
+        uint meta_offset_addr = uint(block_index) * 8u;
+        u1.Store(int(meta_offset_addr), 0);
+        u1.Store(int(meta_offset_addr + 4), 0);
+    }
     if (writes_header && total_words != 0u) {
         // Word 0: ballot (16) | payload_words (12) << 16 | sequence (3) << 28 | extended(=0) << 31
         uint ballot_val = gs_ballot[blk] & 0xffffu;
         gs_pkt[blk * MAX_PACKET_WORDS + 0] = ballot_val | (total_words << 16) | (sequence_code << 28);
 
         // Word 1: modify_quant_code(quant_resolution_code, quant) (8) | block_index (24) << 8
-        int block_index = block_offset_32x32 + block_stride_32x32 * block32x32_y + block32x32_x;
         gs_pkt[blk * MAX_PACKET_WORDS + 1] = modify_quant_code(quant_resolution_code, quant) | (uint(block_index) << 8);
 
         // A block we cannot stage must not be advertised. A zero hole desyncs the decoder.

@@ -751,17 +751,33 @@ pwd3d11_result dwt_run(DWTState *st)
         pcs[i] = pc;
         ctx->UpdateSubresource(st->cb[i].Get(), 0, nullptr, &pcs[i], 0, 0);
     }
+    // The cs_5_0 gather reads t3, the same slot the 4:2:0 path binds. Slot 0
+    // is not a plane. Unbind the previous level's UAV before the next level
+    // gathers that texture.
+    ID3D11SamplerState *samp444 = st->sampler.Get();
+    if (samp444) ctx->CSSetSamplers(0, 1, &samp444);
+    ID3D11ShaderResourceView *none_src[3] = {};
+    ID3D11UnorderedAccessView *none_uav[2] = {};
     for (size_t i = 0; i < disps.size(); i++) {
         const auto &d = disps[i];
+        ID3D11ShaderResourceView *srvs[3] = { d.src, nullptr, nullptr };
         ID3D11UnorderedAccessView *uavs[2] = { d.uav, d.coeff };
-        ctx->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
-        ctx->CSSetShaderResources(0, 1, &d.src);
+        ctx->CSSetUnorderedAccessViews(0, 2, none_uav, nullptr);
+        ctx->CSSetShaderResources(3, 3, none_src);
         ctx->CSSetConstantBuffers(0, 1, st->cb[i].GetAddressOf());
+        ctx->CSSetShaderResources(3, 3, srvs);
+        ctx->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
         ctx->Dispatch(d.gx, d.gy, 1);
     }
 
-    ctx->CSSetShaderResources(0, 1, &nullsrv);
-    ctx->CSSetUnorderedAccessViews(0, 2, nulluav, nullptr);
+    ID3D11ShaderResourceView *nullsrv6[6] = {};
+    ID3D11UnorderedAccessView *nulluav6[6] = {};
+    ID3D11SamplerState *nullsamp = nullptr;
+    ctx->CSSetShaderResources(0, 6, nullsrv6);
+    ctx->CSSetUnorderedAccessViews(0, 6, nulluav6, nullptr);
+    ctx->CSSetSamplers(0, 1, &nullsamp);
+    (void)nullsrv;
+    (void)nulluav;
 
     return PWD3D11_SUCCESS;
 }

@@ -438,11 +438,18 @@ pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder enc,
         enc->pack_srv_quant.Reset();
     }
 
-    UINT zero_bits[4] = {};
-    // Blocks this frame does not pack must stay at num_words 0. They are not
-    // rewritten, so the clear is once per encoder rather than once per frame.
-    if (!enc->clears_done)
-        ctx->ClearUnorderedAccessViewUint(enc->uav_meta.Get(), zero_bits);
+    // Pack writes meta only for blocks that emit words. An empty block on a
+    // later frame must not keep the previous offset and num_words.
+    if (enc->meta_size > 0 && enc->meta_buf) {
+        static std::vector<uint8_t> meta_zeros;
+        if (meta_zeros.size() < size_t(enc->meta_size))
+            meta_zeros.assign(size_t(enc->meta_size), 0);
+        D3D11_BOX meta_zero_box = {};
+        meta_zero_box.right = UINT(enc->meta_size);
+        meta_zero_box.bottom = 1;
+        meta_zero_box.back = 1;
+        ctx->UpdateSubresource(enc->meta_buf.Get(), 0, &meta_zero_box, meta_zeros.data(), 0, 0);
+    }
     enc->clears_done = 1;
 
     if (!enc->pack_srv_meta) {
@@ -592,7 +599,10 @@ pwd3d11_result pwd3d11_encoder_encode_cpu(pwd3d11_encoder enc,
     memcpy(head, stage_bytes_ptr, sizeof(head));
     // Quant 0 can allocate more words than maximum_bitstream_size. UAV stores
     // past the buffer are dropped, so the readback is the prefix that fit.
+    // The copy itself may be shorter than that count. Do not read the meta
+    // image that follows the copied bytes and call it bitstream.
     size_t bit_bytes = size_t(head[1]) * 4u;
+    if (bit_bytes > size_t(copy_bits)) bit_bytes = size_t(copy_bits);
     if (bit_bytes > enc->bitstream_size) bit_bytes = enc->bitstream_size;
     enc->host_bitstream.assign(stage_bytes_ptr + 16, stage_bytes_ptr + 16 + bit_bytes);
     enc->host_meta.assign(stage_bytes_ptr + 16 + copy_bits,
